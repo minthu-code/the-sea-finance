@@ -1,0 +1,23 @@
+services:
+  - type: worker
+    name: the-sea-finance-bot
+    env: docker
+    plan: starter
+    autoDeploy: true
+    disk:
+      name: the-sea-finance-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: DB_PATH
+        value: /data/exhibitledger.db
+      - key: DEFAULT_EXHIBITION
+        value: SHWEDAGON2024
+      - key: EXPORT_DIR
+        value: /data/exports
+      - key: SEED_MMK_TO_THB_RATE
+        sync: false
+      - key: LOG_LEVEL
+        value: INFO

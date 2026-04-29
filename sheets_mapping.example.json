@@ -1,0 +1,86 @@
+{
+  "version": "1.0",
+  "currency": "THB",
+  "mode": "read_only_preview",
+  "exhibition_key_column": "Exhibition Code",
+  "notes": "This file maps existing Google Sheets tabs into ExhibitLedger THB. It is safe: the current bot only reads and previews these tabs.",
+  "sheets": {
+    "cash_book": {
+      "tab_name": "CashBook-Sheet1",
+      "purpose": "Operating expenses, direct costs, advances, and cash movements by exhibition.",
+      "columns": {
+        "date": "Date",
+        "exhibition_code": "Exhibition Code",
+        "description": "Description",
+        "category": "Category",
+        "cash_in_thb": "Cash In",
+        "cash_out_thb": "Cash Out",
+        "payment_method": "Payment Method",
+        "reference": "Reference",
+        "notes": "Notes"
+      },
+      "classification_rules": {
+        "expense_default_section": "operating_expense",
+        "direct_cost_keywords": ["artist", "commission", "canvas", "catalog", "printing", "transport", "installation", "framing"],
+        "operating_expense_keywords": ["ticket", "air cargo", "venue", "snack", "photographer", "hotel", "meal", "event"]
+      }
+    },
+    "stock_sales": {
+      "tab_name": "Stock&Sales-PaintingsList",
+      "purpose": "Artwork inventory, sales status, selling price, buyer, and exhibition assignment.",
+      "columns": {
+        "artwork_id": "Artwork ID",
+        "exhibition_code": "Exhibition Code",
+        "artist": "Artist",
+        "title": "Title",
+        "size": "Size",
+        "medium": "Medium",
+        "status": "Status",
+        "selling_price_thb": "Selling Price",
+        "discount_thb": "Discount",
+        "net_sale_thb": "Net Sale",
+        "buyer": "Buyer",
+        "sale_date": "Sale Date"
+      },
+      "classification_rules": {
+        "sold_status_values": ["sold", "paid", "completed"],
+        "sales_bridge_section": "sales_bridge",
+        "owned_work_revenue_section": "gallery_revenue"
+      }
+    },
+    "commission": {
+      "tab_name": "22PlatformofShweDagonCommissionAllArtists-E",
+      "purpose": "Artist-facing commission and settlement records.",
+      "columns": {
+        "exhibition_code": "Exhibition Code",
+        "artist": "Artist",
+        "invoice_ref": "Invoice No",
+        "gross_sale_thb": "Gross Sale",
+        "gallery_commission_thb": "Gallery Commission",
+        "artist_payable_thb": "Artist Payable",
+        "paid_thb": "Paid",
+        "outstanding_thb": "Outstanding",
+        "status": "Status",
+        "notes": "Notes"
+      },
+      "classification_rules": {
+        "artist_payable_section": "direct_cost",
+        "consignment_revenue_basis": "gallery_commission_only"
+      }
+    },
+    "estimated_pnl": {
+      "tab_name": "22ShweDagonPlatformEstimatedP&L-Sheet1",
+      "purpose": "Management P&L estimate by exhibition, used for comparison against generated actuals.",
+      "columns": {
+        "exhibition_code": "Exhibition Code",
+        "section": "Section",
+        "category": "Category",
+        "description": "Description",
+        "amount_thb": "Amount",
+        "source_ref": "Source Ref",
+        "notes": "Notes"
+      },
+      "allowed_sections": ["sales_bridge", "gallery_revenue", "direct_cost", "operating_expense", "allocated_overhead"]
+    }
+  }
+}
