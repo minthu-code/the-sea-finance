@@ -1,9 +1,10 @@
 services:
-  - type: worker
+  - type: web
     name: the-sea-finance-bot
     env: docker
     plan: starter
     autoDeploy: true
+    healthCheckPath: /health
     disk:
       name: the-sea-finance-data
       mountPath: /data

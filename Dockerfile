@@ -16,4 +16,6 @@ ENV DB_PATH=/data/exhibitledger.db
 ENV EXPORT_DIR=/data/exports
 ENV DEFAULT_EXHIBITION=SHWEDAGON2024
 
+EXPOSE 10000
+
 CMD ["python", "main.py"]

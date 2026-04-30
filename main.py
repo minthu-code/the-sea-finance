@@ -1,6 +1,8 @@
 import logging
 import os
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import Thread
 from typing import List, Tuple
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -57,6 +59,56 @@ logging.getLogger("telegram.ext").setLevel(logging.INFO)
 
 DEFAULT_EXHIBITION = os.environ.get("DEFAULT_EXHIBITION", "SHWEDAGON2024")
 ALLOWED_SPLIT_TYPES = {"gallery", "artist", "collaborator", "collector"}
+
+
+# ---------------------------------------------------------------------------
+# Render Web Service health port
+# ---------------------------------------------------------------------------
+
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    """Tiny HTTP endpoint so Render Web Services can detect an open port.
+
+    The Telegram bot still runs in polling mode. This server only answers Render's
+    health/port check and does not expose any finance data.
+    """
+
+    def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        if self.path in {"/", "/health", "/healthz"}:
+            body = b"TheSeaFinance bot is running.\n"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def log_message(self, fmt: str, *args: object) -> None:
+        logger.debug("Health check: " + fmt, *args)
+
+
+def start_render_health_server() -> None:
+    """Start a background HTTP health server when Render provides PORT.
+
+    Render Web Services must bind to a port. Background workers normally do not
+    set PORT, so this function quietly does nothing for worker deployments.
+    """
+
+    raw_port = os.environ.get("PORT")
+    if not raw_port:
+        return
+    try:
+        port = int(raw_port)
+    except ValueError:
+        logger.warning("Ignoring invalid PORT value: %s", raw_port)
+        return
+
+    server = ThreadingHTTPServer(("0.0.0.0", port), _HealthHandler)
+    thread = Thread(target=server.serve_forever, name="render-health-server", daemon=True)
+    thread.start()
+    logger.info("Render health server listening on port %s", port)
 
 
 # ---------------------------------------------------------------------------
@@ -1043,6 +1095,7 @@ def build_application() -> Application:
 
 
 def main() -> None:
+    start_render_health_server()
     app = build_application()
     logger.info("Starting ExhibitLedger THB bot in polling mode")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
