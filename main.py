@@ -1,12 +1,19 @@
+import base64
+import io
 import logging
 import os
+from dotenv import load_dotenv
+
+load_dotenv()
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
 from typing import List, Tuple
 
+import pytesseract
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
+from telegram.error import BadRequest, Conflict, Forbidden, NetworkError, TelegramError, TimedOut
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from exhibitledger import (
@@ -46,6 +53,18 @@ from exhibitledger import (
     update_pending_amount,
 )
 from sheets_integration import format_sheets_status_markdown, format_sync_preview_markdown
+
+# Optional OpenAI client for enhanced receipt processing
+ai_client = None
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+if OPENAI_API_KEY and OPENAI_API_KEY.strip():
+    try:
+        from openai import OpenAI
+
+        ai_client = OpenAI()
+        logging.info("OpenAI client initialized for enhanced receipt scanning.")
+    except Exception as e:
+        logging.warning(f"Could not initialize OpenAI client: {e}. Using OCR fallback.")
 
 
 logging.basicConfig(
@@ -694,7 +713,13 @@ def _flow_prompt(flow_name: str, context: ContextTypes.DEFAULT_TYPE) -> str:
 
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except BadRequest as e:
+        if "Query is too old" in str(e):
+            logger.warning("Callback query too old to answer")
+        else:
+            raise
     data = query.data or ""
     try:
         if data == "menu:home":
@@ -946,7 +971,13 @@ async def _handle_guided_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def expense_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except BadRequest as e:
+        if "Query is too old" in str(e):
+            logger.warning("Callback query too old to answer")
+        else:
+            raise
     try:
         parts = query.data.split(":")
         action = parts[1]
@@ -1038,16 +1069,105 @@ async def handle_text_expense(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(f"Could not capture this expense: {exc}")
 
 
+async def _process_receipt_image(photo_file) -> str:
+    """Extract text from a photo using OCR or AI."""
+    # Read image into memory
+    image_bytes = await photo_file.download_as_bytearray()
+    image = Image.open(io.BytesIO(image_bytes))
+
+    # Try AI first if available
+    if ai_client:
+        try:
+            # Convert to base64 for GPT-4o-mini
+            buffered = io.BytesIO()
+            image.save(buffered, format="JPEG")
+            base64_image = base64.b64encode(buffered.getvalue()).decode("utf-8")
+
+            response = ai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Extract all text from this receipt. Focus on the total amount and items."},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}},
+                        ],
+                    }
+                ],
+                max_tokens=300,
+            )
+            ai_text = response.choices[0].message.content
+            if ai_text:
+                return ai_text
+        except Exception as e:
+            logger.warning(f"AI receipt extraction failed: {e}. Falling back to Tesseract.")
+
+    # Fallback to Tesseract OCR
+    try:
+        return pytesseract.image_to_string(image)
+    except Exception as e:
+        logger.error(f"Tesseract OCR failed: {e}")
+        return ""
+
+
 async def handle_photo_expense(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
-        caption = update.message.caption or "Receipt photo"
-        code, raw_text = _extract_receipt_code_and_text(context, caption)
-        photo_file_id = update.message.photo[-1].file_id if update.message.photo else None
+        # Send a "processing" message
+        status_msg = await update.message.reply_text("Scanning receipt... 🔍")
+
+        caption = update.message.caption or ""
+        photo = update.message.photo[-1]
+        photo_file = await photo.get_file()
+
+        # Extract text from image
+        ocr_text = await _process_receipt_image(photo_file)
+
+        # Combine caption and OCR text
+        combined_text = f"{caption}\n\n{ocr_text}".strip()
+
+        code, raw_text = _extract_receipt_code_and_text(context, combined_text)
+        photo_file_id = photo.file_id
+
         pending = create_pending_expense(code, raw_text, photo_file_id=photo_file_id)
-        await update.message.reply_text(format_pending_expense_card(pending), reply_markup=_pending_keyboard(pending["id"]))
+
+        # Delete status message and send result
+        await status_msg.delete()
+        await update.message.reply_text(
+            format_pending_expense_card(pending),
+            reply_markup=_pending_keyboard(pending["id"])
+        )
     except Exception as exc:
         logger.exception("Failed to capture photo receipt")
         await update.message.reply_text(f"Could not capture this receipt photo: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Error handling
+# ---------------------------------------------------------------------------
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log the error and send a telegram message to notify the developer."""
+    logger.error("Exception while handling an update:", exc_info=context.error)
+
+    # Handle specific errors
+    if isinstance(context.error, Conflict):
+        logger.error("Conflict error: another bot instance is running.")
+        return
+    if isinstance(context.error, NetworkError):
+        logger.error("Network error occurred.")
+        return
+    if isinstance(context.error, Forbidden):
+        logger.error("Bot was blocked by the user.")
+        return
+
+    # Notify user if possible
+    if isinstance(update, Update) and update.effective_message:
+        text = "Sorry, an unexpected error occurred. I've logged it and will look into it."
+        try:
+            await update.effective_message.reply_text(text)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -1091,6 +1211,10 @@ def build_application() -> Application:
     application.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^(menu:|flow:|preset_split:|useexh:|quick:|report:)"))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo_expense))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_expense))
+
+    # Register error handler
+    application.add_error_handler(error_handler)
+
     return application
 
 

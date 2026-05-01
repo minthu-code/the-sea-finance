@@ -8,6 +8,13 @@ Unzip the GitHub upload package locally and upload the extracted files into your
 
 The repository should contain files such as `main.py`, `exhibitledger.py`, `Dockerfile`, `render.yaml`, `requirements.txt`, `.env.example`, `.gitignore`, `.dockerignore`, and this deployment guide.
 
+### Receipt Scanning (OCR & AI)
+
+This version includes enhanced receipt scanning:
+- **AI Scanning**: If you provide an `OPENAI_API_KEY`, the bot uses GPT-4o-mini to intelligently extract items and totals from receipt photos.
+- **OCR Fallback**: If no API key is provided, the bot uses local Tesseract OCR (installed via Docker) to extract text from photos.
+- **Manual Review**: All scanned receipts are staged as "Pending" for your review and approval before being posted to the P&L.
+
 ## 2. Required Render settings
 
 The included `render.yaml` creates a Docker-based Web Service named `the-sea-finance-bot`. It defines a persistent disk mounted at `/data` and a health check path at `/health`.
@@ -37,6 +44,7 @@ Set these in Render. Never commit real tokens to GitHub.
 | `EXPORT_DIR` | Yes | `/data/exports` |
 | `SEED_MMK_TO_THB_RATE` | Optional | Only needed when reseeding old MMK source data |
 | `LOG_LEVEL` | Optional | `INFO` |
+| `OPENAI_API_KEY` | Optional | Your OpenAI API key for enhanced AI receipt scanning. If not provided, the bot falls back to local Tesseract OCR. |
 
 Render automatically provides `PORT` for Web Services. You do not need to set `PORT` manually.
 

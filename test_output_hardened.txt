@@ -1,0 +1,69 @@
+*THE SEA ART GALLERY*
+*Profit & Loss Statement*
+Exhibition: *Shwe Dagon Platform Exhibition* (`SHWEDAGON2024`)
+Location: Bangkok / Yangon logistics
+Period: 2024-09-01 to 2024-09-28
+Currency: *THB only*
+Generated: 2026-04-28 10:15
+
+*A. Sales Bridge*
+• Gross artwork sales: ฿320,640.00 THB
+
+Gross Artwork Sales / Activity: *฿320,640.00 THB*
+
+*B. Gallery Revenue*
+• Gallery artwork revenue: ฿320,640.00 THB
+
+Total Gallery Revenue: *฿320,640.00 THB*
+
+*C. Direct Costs*
+• Artists' fees / artist share: ฿171,386.67 THB
+• Rotary commission: ฿2,880.00 THB
+• Blank canvas: ฿9,046.67 THB
+• Catalog printing: ฿8,000.00 THB
+• Local transportation of paintings in BKK: ฿2,241.00 THB
+
+Total Direct Costs: *฿193,554.34 THB*
+
+*Gross Profit:* *฿127,085.66 THB* (39.6%)
+
+*D. Exhibition Operating Expenses*
+• Air cargo YGN-BKK: ฿15,700.00 THB
+• Air cargo BKK-YGN: ฿3,300.00 THB
+• Air tickets for CS: ฿19,260.33 THB
+• Rental of exhibition space: ฿26,215.00 THB
+• Utensil renting: ฿3,100.00 THB
+• Coffee & snacks: ฿19,000.00 THB
+• Photographer: ฿3,300.00 THB
+
+Total Operating Expenses: *฿89,875.33 THB*
+
+*Contribution Profit:* *฿37,210.33 THB* (11.6%)
+
+*E. Allocated Overhead*
+_No lines recorded._
+
+Allocated Overhead: *฿0.00 THB*
+
+*NET PROFIT / (LOSS):* *฿37,210.33 THB* (11.6%)
+
+*Artist Payable Control*
+Artist Payable Total: *฿25,000.00 THB*
+Paid: *฿0.00 THB*
+Outstanding: *฿25,000.00 THB*
+
+_Note: This prototype is THB-only. If seeded from MMK files, use the correct historical conversion rate before relying on numbers for real decisions._
+
+================================================================================
+
+*Artist Payables — Shwe Dagon Platform Exhibition*
+
+• *Aye Nyein Myint* — Gross ฿50,000; Gallery commission ฿25,000; Artist payable ฿25,000; Outstanding ฿25,000; Status: Pending
+
+================================================================================
+
+Data quality checks:
+- Some rows were imported from non-THB sources. Confirm conversion rate before final use.
+- Artist commission records appear partial or unmapped; gross sales bridge does not yet reconcile to all artist sale records.
+
+Exported: exports/SHWEDAGON2024_pnl_report.xlsx
