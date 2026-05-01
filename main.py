@@ -11,6 +11,7 @@ from threading import Thread
 from typing import List, Tuple
 
 import pytesseract
+from PIL import Image
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, Conflict, Forbidden, NetworkError, TelegramError, TimedOut
@@ -20,6 +21,7 @@ from exhibitledger import (
     account_head_names,
     add_artwork,
     confirm_pending_expense,
+    connect,
     create_exhibition,
     create_pending_expense,
     data_quality_checks,
@@ -427,6 +429,10 @@ def _command_guide_text() -> str:
         "/readiness <CODE>\n"
         "/data_check <CODE>\n"
         "/export <CODE>\n\n"
+        "Edit artworks (fix title, artist, or price):\n"
+        "/edit_artwork <ID> title <NEW TITLE>\n"
+        "/edit_artwork <ID> artist <NEW ARTIST NAME>\n"
+        "/edit_artwork <ID> price <NEW PRICE THB>\n\n"
         "Google Sheets commands remain read-only and optional: /sheets_status and /sync_preview. Use /cancel at any time to stop a guided action."
     )
 
@@ -516,6 +522,60 @@ async def add_artwork_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception as exc:
         logger.exception("Failed to add artwork")
         await update.message.reply_text(f"Could not add artwork: {exc}")
+
+
+async def edit_artwork_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        if len(context.args) < 3:
+            raise ValueError(
+                "Usage:\n"
+                "/edit_artwork <ID> title New Title Here\n"
+                "/edit_artwork <ID> artist New Artist Name\n"
+                "/edit_artwork <ID> price 350000\n\n"
+                "Example: /edit_artwork 3 title In & Out"
+            )
+        artwork_id = int(context.args[0])
+        field = context.args[1].lower().strip()
+        new_value = " ".join(context.args[2:]).strip()
+
+        if field not in {"title", "artist", "price"}:
+            raise ValueError("Field must be one of: title, artist, price")
+        if not new_value:
+            raise ValueError("New value cannot be empty.")
+
+        with connect() as conn:
+            row = conn.execute("SELECT * FROM artworks WHERE id = ?", (artwork_id,)).fetchone()
+            if not row:
+                raise ValueError(f"Artwork #{artwork_id} not found.")
+            row = dict(row)
+            if row.get("status") == "sold":
+                raise ValueError(f"Artwork #{artwork_id} is already sold and cannot be edited.")
+
+            if field == "price":
+                price = _parse_float(new_value, "Price")
+                conn.execute("UPDATE artworks SET asking_price_thb = ? WHERE id = ?", (price, artwork_id))
+                log_action("edit_artwork", row["exhibition_code"], f"Updated artwork #{artwork_id} price to {money(price)}")
+                await update.message.reply_text(
+                    f"Artwork #{artwork_id} updated.\nTitle: {row['title']}\nArtist: {row['artist']}\nNew Asking Price: {money(price)}",
+                    reply_markup=_artwork_menu_keyboard(),
+                )
+            elif field == "title":
+                conn.execute("UPDATE artworks SET title = ? WHERE id = ?", (new_value, artwork_id))
+                log_action("edit_artwork", row["exhibition_code"], f"Updated artwork #{artwork_id} title from '{row['title']}' to '{new_value}'")
+                await update.message.reply_text(
+                    f"Artwork #{artwork_id} updated.\nNew Title: {new_value}\nArtist: {row['artist']}\nAsking Price: {money(row['asking_price_thb'])}",
+                    reply_markup=_artwork_menu_keyboard(),
+                )
+            elif field == "artist":
+                conn.execute("UPDATE artworks SET artist = ? WHERE id = ?", (new_value, artwork_id))
+                log_action("edit_artwork", row["exhibition_code"], f"Updated artwork #{artwork_id} artist from '{row['artist']}' to '{new_value}'")
+                await update.message.reply_text(
+                    f"Artwork #{artwork_id} updated.\nTitle: {row['title']}\nNew Artist: {new_value}\nAsking Price: {money(row['asking_price_thb'])}",
+                    reply_markup=_artwork_menu_keyboard(),
+                )
+    except Exception as exc:
+        logger.exception("Failed to edit artwork")
+        await update.message.reply_text(f"Could not edit artwork: {exc}")
 
 
 async def artworks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -716,8 +776,9 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     try:
         await query.answer()
     except BadRequest as e:
-        if "Query is too old" in str(e):
-            logger.warning("Callback query too old to answer")
+        if "Query is too old" in str(e) or "query id is invalid" in str(e).lower():
+            logger.warning("Callback query too old — ignoring stale button tap")
+            return
         else:
             raise
     data = query.data or ""
@@ -810,7 +871,10 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         raise ValueError(f"Unknown menu action: {data}")
     except Exception as exc:
         logger.exception("Menu callback failed")
-        await query.edit_message_text(f"Could not complete action: {exc}", reply_markup=_main_menu_keyboard())
+        try:
+            await query.edit_message_text(f"Could not complete action: {exc}", reply_markup=_main_menu_keyboard())
+        except Exception:
+            pass
 
 
 async def _handle_report_callback(query, context: ContextTypes.DEFAULT_TYPE, report_name: str) -> None:
@@ -974,8 +1038,9 @@ async def expense_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     try:
         await query.answer()
     except BadRequest as e:
-        if "Query is too old" in str(e):
-            logger.warning("Callback query too old to answer")
+        if "Query is too old" in str(e) or "query id is invalid" in str(e).lower():
+            logger.warning("Expense callback query too old — ignoring stale button tap")
+            return
         else:
             raise
     try:
@@ -1028,7 +1093,10 @@ async def expense_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         raise ValueError(f"Unknown callback action: {action}")
     except Exception as exc:
         logger.exception("Expense callback failed")
-        await query.edit_message_text(f"Could not update receipt: {exc}", reply_markup=_expense_menu_keyboard())
+        try:
+            await query.edit_message_text(f"Could not update receipt: {exc}", reply_markup=_expense_menu_keyboard())
+        except Exception:
+            pass
 
 
 async def handle_text_expense(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1191,6 +1259,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("set_split", set_split))
     application.add_handler(CommandHandler("split", split))
     application.add_handler(CommandHandler("add_artwork", add_artwork_command))
+    application.add_handler(CommandHandler("edit_artwork", edit_artwork_command))
     application.add_handler(CommandHandler("artworks", artworks))
     application.add_handler(CommandHandler("inventory", inventory))
     application.add_handler(CommandHandler("sold", sold))
