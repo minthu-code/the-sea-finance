@@ -1347,6 +1347,25 @@ def _seed_shwedagon_if_missing() -> None:
         )
 
 
+async def reseed_shwedagon(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Force a full reseed of SHWEDAGON2024 — wipes old data and reloads all 26 artists."""
+    await update.message.reply_text("Reseeding SHWEDAGON2024... please wait.")
+    try:
+        with connect() as conn:
+            conn.execute("DELETE FROM artist_payables WHERE exhibition_code = 'SHWEDAGON2024'")
+            conn.execute("DELETE FROM pnl_lines WHERE exhibition_code = 'SHWEDAGON2024'")
+            conn.execute("DELETE FROM exhibitions WHERE code = 'SHWEDAGON2024'")
+        _seed_shwedagon_if_missing()
+        await update.message.reply_text(
+            "SHWEDAGON2024 reseeded successfully.\n"
+            "26 artists and all P&L lines are now loaded.\n"
+            "Use /export SHWEDAGON2024 to get the Excel report."
+        )
+    except Exception as exc:
+        logger.exception("Reseed failed")
+        await update.message.reply_text(f"Reseed failed: {exc}")
+
+
 def build_application() -> Application:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -1389,6 +1408,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("export", export))
     application.add_handler(CommandHandler("sheets_status", sheets_status))
     application.add_handler(CommandHandler("sync_preview", sync_preview))
+    application.add_handler(CommandHandler("reseed_shwedagon", reseed_shwedagon))
     application.add_handler(CallbackQueryHandler(expense_callback, pattern=r"^expense:"))
     application.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^(menu:|flow:|preset_split:|useexh:|quick:|report:)"))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo_expense))
