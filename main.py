@@ -2,6 +2,7 @@ import base64
 import io
 import logging
 import os
+from datetime import datetime
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -1243,11 +1244,123 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 # ---------------------------------------------------------------------------
 
 
+def _seed_shwedagon_if_missing() -> None:
+    """Seed the Shwe Dagon exhibition on first run if it is not already in the database."""
+    from exhibitledger import connect
+    CODE = "SHWEDAGON2024"
+    conversion_rate = float(os.environ.get("SEED_MMK_TO_THB_RATE", "0.006666666666666667"))
+
+    def thb(mmk: float) -> float:
+        return round(mmk * conversion_rate, 2)
+
+    with connect() as conn:
+        conn.execute(
+            """INSERT INTO exhibitions
+               (code, name, location, start_date, end_date, status, currency, notes)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (CODE, "Shwe Dagon Platform Exhibition", "Bangkok / Yangon logistics",
+             "2024-09-01", "2024-09-28", "completed", "THB",
+             f"Auto-seeded from source Excel. MMK lines at rate={conversion_rate}. "
+             "Artist THB prices from Sheet2 artist list."),
+        )
+
+        pnl_lines = [
+            ("sales_bridge",      "Gross artwork sales",                  "Sales of paintings — Sheet1",                             48_096_000, 10),
+            ("gallery_revenue",   "Gallery artwork revenue",              "Gross revenue — Sheet1. 50% commission basis.",           48_096_000, 20),
+            ("direct_cost",       "Artists' fees / artist share",         "50% artist share — Sheet1",                               25_708_000, 30),
+            ("direct_cost",       "Rotary commission",                    "Partner commission — Sheet1",                                432_000, 31),
+            ("direct_cost",       "Blank canvas",                         "Artwork preparation — Sheet1",                             1_357_000, 32),
+            ("direct_cost",       "Catalog printing",                     "Catalog printing — Sheet1",                                1_200_000, 33),
+            ("direct_cost",       "Local transportation (BKK paintings)", "Local artwork transport — Sheet1",                           336_150, 34),
+            ("operating_expense", "Air cargo YGN→BKK",                   "Inbound exhibition logistics — Sheet1",                    2_355_000, 40),
+            ("operating_expense", "Air cargo BKK→YGN",                   "Return exhibition logistics — Sheet1",                       495_000, 41),
+            ("operating_expense", "Air tickets for CS",                   "Travel cost — Sheet1",                                     2_889_050, 42),
+            ("operating_expense", "Rental of exhibition space",           "Venue rental — Sheet1",                                    3_932_250, 43),
+            ("operating_expense", "Utensil renting",                      "Event supply rental — Sheet1",                               465_000, 44),
+            ("operating_expense", "Coffee & snacks",                      "Opening/event hospitality — Sheet1",                       2_850_000, 45),
+            ("operating_expense", "Photographer",                         "Photography cost — Sheet1",                                  495_000, 46),
+        ]
+        for section, category, description, amount_mmk, sort_order in pnl_lines:
+            conn.execute(
+                """INSERT INTO pnl_lines
+                   (exhibition_code, section, category, description,
+                    amount_thb, source_amount, source_currency, source_ref, sort_order)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (CODE, section, category, description,
+                 thb(amount_mmk), amount_mmk, "MMK",
+                 "22ShweDagonPlatformEstimatedP&L-Sheet1", sort_order),
+            )
+
+        # Artist payables — Sheet2 explicit THB prices, 50/50 commission split
+        artists = [
+            ("U Lu Min",            2,  126_000),
+            ("Zaw Win Phay",        2,  133_000),
+            ("Min Zayar Oo",        2,   29_750),
+            ("Kyi Hlaing Aung",     3,   29_750),
+            ("Kaung Paing",         1,   22_750),
+            ("Kyaw Lin",            2,   29_750),
+            ("Aye Nyein Myint",     2,   29_750),
+            ("Nu Nu",               3,   29_750),
+            ("Ye Aung Myat",        2,   29_750),
+            ("Orient Thant Zin",    1,   35_000),
+            ("Maung Maung Yin Min", 1,   35_000),
+            ("Myoe Kyaw",           2,   52_500),
+            ("Aung Ko",             2,   28_000),
+            ("Hla Phone Aung",      1,   28_000),
+            ("Win Myint Moe",       4,   42_000),
+            ("Aye Min",             2,   29_750),
+            ("Nann Nann",           4,   61_250),
+            ("CNK",                 3,   52_500),
+            ("Ba Sai Wunna",        3,   35_000),
+            ("Mann Zar Hein",       2,   35_000),
+            ("Saw Lin Aung",        2,   70_000),
+            ("Mor Mor",             2,  126_000),
+            ("U Thu Won",           1,   28_000),
+            ("U Hla Htun Aung",     2,   42_000),
+            ("Thee Zar",            2,   70_000),
+            ("Nyi Htut",            2,   70_000),
+        ]
+        for artist_name, num_paintings, unit_thb in artists:
+            gross = round(num_paintings * unit_thb, 2)
+            gallery_commission = round(gross * 0.50, 2)
+            artist_payable = round(gross - gallery_commission, 2)
+            conn.execute(
+                """INSERT INTO artist_payables
+                   (exhibition_code, artist, invoice_ref,
+                    gross_sale_thb, gallery_commission_thb, artist_payable_thb,
+                    paid_thb, outstanding_thb, status,
+                    source_amount, source_currency, notes)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (CODE, artist_name, f"ShweDagon-{artist_name.replace(' ', '')}",
+                 gross, gallery_commission, artist_payable,
+                 0.0, artist_payable, "Pending",
+                 gross, "THB",
+                 f"{num_paintings} painting(s) at ฿{unit_thb:,.0f} each. "
+                 "Sheet2 THB price. 50% gallery commission."),
+            )
+
+        conn.execute(
+            "INSERT INTO audit_log (timestamp, action, exhibition_code, details) VALUES (?, ?, ?, ?)",
+            (datetime.utcnow().isoformat(timespec="seconds") + "Z",
+             "auto_seed_shwedagon", CODE,
+             f"{len(pnl_lines)} P&L lines + {len(artists)} artists seeded on startup."),
+        )
+
+
 def build_application() -> Application:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set. Create a bot with BotFather and set the token first.")
     init_db()
+
+    # Auto-seed SHWEDAGON2024 once on first deploy if not already present.
+    try:
+        if not get_exhibition("SHWEDAGON2024"):
+            _seed_shwedagon_if_missing()
+            logger.info("Auto-seeded SHWEDAGON2024 on startup.")
+    except Exception as _seed_err:
+        logger.warning("Could not auto-seed SHWEDAGON2024: %s", _seed_err)
+
     application = Application.builder().token(token).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("menu", menu_command))
