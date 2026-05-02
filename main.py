@@ -2,6 +2,8 @@ import base64
 import io
 import logging
 import os
+import re
+import sqlite3
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -249,9 +251,20 @@ def _split_menu_keyboard() -> InlineKeyboardMarkup:
 def _artwork_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("Register Artwork", callback_data="flow:add_artwork"), InlineKeyboardButton("List Artworks", callback_data="report:artworks")],
-            [InlineKeyboardButton("Record Sale", callback_data="flow:record_sale"), InlineKeyboardButton("Inventory Dashboard", callback_data="report:inventory")],
+            [InlineKeyboardButton("Register Artwork", callback_data="artwork:register_options"), InlineKeyboardButton("List Artworks", callback_data="report:artworks")],
+            [InlineKeyboardButton("Edit Artwork", callback_data="artwork:edit_hint"), InlineKeyboardButton("Inventory Dashboard", callback_data="report:inventory")],
+            [InlineKeyboardButton("Record Sale", callback_data="flow:record_sale")],
             [InlineKeyboardButton("Back", callback_data="menu:home")],
+        ]
+    )
+
+
+def _artwork_register_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Manual Input", callback_data="flow:add_artwork")],
+            [InlineKeyboardButton("Bulk Import (Excel)", callback_data="artwork:bulk_import")],
+            [InlineKeyboardButton("Back", callback_data="menu:artworks")],
         ]
     )
 
@@ -369,6 +382,173 @@ def _extract_receipt_code_and_text(context: ContextTypes.DEFAULT_TYPE, text: str
     return _current_exhibition(context), text
 
 
+def generate_artwork_template_xlsx() -> str:
+    """Generate and return path to the artwork bulk import template Excel file."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Artworks"
+
+    headers = ["Title", "Artist", "Asking Price THB", "Notes (optional)"]
+    header_fill = PatternFill(fill_type="solid", fgColor="1F4E79")
+    header_font = Font(bold=True, color="FFFFFF")
+    for col, h in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col, value=h)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center")
+
+    # Sample rows so the user understands the format
+    samples = [
+        ["Red Eye Balls", "Aung Myint", 400000, ""],
+        ["In & Out", "Aung Myint", 304000, "Special framing required"],
+        ["Morning Light", "Artist Name", 120000, ""],
+    ]
+    for row in samples:
+        ws.append(row)
+
+    # Instructions sheet
+    ws2 = wb.create_sheet("Instructions")
+    ws2.append(["Column", "Required", "Notes"])
+    ws2.append(["Title", "Yes", "Artwork title — special characters like & are fine"])
+    ws2.append(["Artist", "Yes", "Artist full name"])
+    ws2.append(["Asking Price THB", "Yes", "Number only, no commas or currency symbols"])
+    ws2.append(["Notes (optional)", "No", "Any extra notes about the artwork"])
+    ws2.append(["", "", ""])
+    ws2.append(["", "", "Delete the 3 sample rows before uploading."])
+    ws2.append(["", "", "Upload this file back to the bot after filling it in."])
+
+    ws.column_dimensions["A"].width = 35
+    ws.column_dimensions["B"].width = 25
+    ws.column_dimensions["C"].width = 20
+    ws.column_dimensions["D"].width = 35
+
+    export_dir = os.environ.get("EXPORT_DIR", "./exports")
+    os.makedirs(export_dir, exist_ok=True)
+    path = os.path.join(export_dir, "artwork_import_template.xlsx")
+    wb.save(path)
+    return path
+
+
+async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle Excel file uploads for bulk artwork import."""
+    doc = update.message.document
+    if not doc:
+        return
+    fname = doc.file_name or ""
+    if not fname.lower().endswith((".xlsx", ".xls")):
+        await update.message.reply_text(
+            "Please upload an Excel file (.xlsx) using the artwork import template.\n"
+            "Tap Menu → Artworks & Sales → Register Artwork → Bulk Import to get the template."
+        )
+        return
+
+    # Only process if user flagged this as artwork import (or if file is named like the template)
+    if not (context.user_data.get("flow", {}).get("name") == "bulk_artwork"
+            or "artwork" in fname.lower() or "import" in fname.lower()):
+        return  # Not for us — ignore other Excel uploads
+
+    await update.message.reply_text("Reading Excel file... please wait.")
+    _clear_flow(context)
+
+    try:
+        from openpyxl import load_workbook
+
+        file = await doc.get_file()
+        raw = await file.download_as_bytearray()
+
+        wb = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+        ws = wb.active
+        rows = list(ws.iter_rows(min_row=2, values_only=True))  # skip header row
+
+        code = _current_exhibition(context)
+        registered = []
+        skipped = []
+
+        for i, row in enumerate(rows, start=2):
+            if not row or all(v is None or str(v).strip() == "" for v in row):
+                continue  # blank row
+            title = str(row[0]).strip() if row[0] is not None else ""
+            artist = str(row[1]).strip() if len(row) > 1 and row[1] is not None else ""
+            price_raw = row[2] if len(row) > 2 else None
+            notes = str(row[3]).strip() if len(row) > 3 and row[3] is not None else ""
+
+            if not title or not artist:
+                skipped.append(f"Row {i}: missing title or artist")
+                continue
+            try:
+                price = float(str(price_raw).replace(",", "").strip())
+                if price <= 0:
+                    raise ValueError("Price must be greater than 0")
+            except Exception:
+                skipped.append(f"Row {i} ({title}): invalid price '{price_raw}'")
+                continue
+
+            try:
+                artwork_row = add_artwork(code, title, artist, price)
+                registered.append(f"#{artwork_row['id']} {title} — {artist} — {money(price)}")
+            except Exception as exc:
+                skipped.append(f"Row {i} ({title}): {exc}")
+
+        lines = [f"Bulk import complete for {code}.", f"", f"Registered {len(registered)} artwork(s):"]
+        lines.extend(f"  ✅ {r}" for r in registered)
+        if skipped:
+            lines.append(f"")
+            lines.append(f"Skipped {len(skipped)} row(s):")
+            lines.extend(f"  ⚠️ {s}" for s in skipped)
+
+        await update.message.reply_text("\n".join(lines), reply_markup=_artwork_menu_keyboard())
+
+    except Exception as exc:
+        logger.exception("Bulk artwork import failed")
+        await update.message.reply_text(
+            f"Could not read the Excel file: {exc}\n\nMake sure you used the artwork import template."
+        )
+
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Quick one-line status: current exhibition + key numbers."""
+    code = _current_exhibition(context)
+    try:
+        ex = get_exhibition(code)
+        if not ex:
+            rows = list_exhibitions()
+            if rows:
+                names = "\n".join(f"  • {r['code']} — {r['name']}" for r in rows[:10])
+                await update.message.reply_text(
+                    f"No active exhibition set.\n\nAvailable exhibitions:\n{names}\n\n"
+                    "Use /use <CODE> or tap Menu → Exhibitions → Switch Exhibition.",
+                    reply_markup=_exhibition_menu_keyboard(),
+                )
+            else:
+                await update.message.reply_text("No exhibitions found. Create one first via /menu.")
+            return
+
+        from exhibitledger import connect as _conn
+        with _conn() as conn:
+            artworks_total = conn.execute("SELECT COUNT(*) FROM artworks WHERE exhibition_code=?", (code,)).fetchone()[0]
+            artworks_sold = conn.execute("SELECT COUNT(*) FROM artworks WHERE exhibition_code=? AND status='sold'", (code,)).fetchone()[0]
+            pending_count = conn.execute("SELECT COUNT(*) FROM pending_expenses WHERE exhibition_code=? AND status='pending'", (code,)).fetchone()[0]
+            net_row = conn.execute(
+                "SELECT SUM(CASE WHEN section IN ('sales_bridge','gallery_revenue') THEN amount_thb ELSE -amount_thb END) "
+                "FROM pnl_lines WHERE exhibition_code=?", (code,)
+            ).fetchone()[0] or 0
+
+        lines = [
+            f"Current exhibition: {code} — {ex['name']}",
+            f"Artworks: {artworks_sold} sold / {artworks_total} total",
+            f"Pending receipts: {pending_count}",
+            f"Net P&L so far: {money(net_row)}",
+        ]
+        if pending_count > 5:
+            lines.append(f"⚠️ {pending_count} receipts awaiting approval — review with /pending {code}")
+        await update.message.reply_text("\n".join(lines), reply_markup=_main_menu_keyboard())
+    except Exception as exc:
+        await update.message.reply_text(f"Could not get status: {exc}")
+
+
 # ---------------------------------------------------------------------------
 # Core command handlers
 # ---------------------------------------------------------------------------
@@ -376,11 +556,26 @@ def _extract_receipt_code_and_text(context: ContextTypes.DEFAULT_TYPE, text: str
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _clear_flow(context)
+    code = _current_exhibition(context)
+    ex = get_exhibition(code)
+    if ex:
+        exhibition_line = f"Current working exhibition: {code} — {ex['name']}"
+    else:
+        # Context was wiped (redeploy) or no exhibition set yet
+        rows = list_exhibitions()
+        if rows:
+            exhibition_line = (
+                "⚠️ Your active exhibition was reset (this happens after bot updates).\n"
+                "Use /use <CODE> or tap Exhibitions → Switch Exhibition to reselect.\n\n"
+                "Your exhibitions:\n" + "\n".join(f"  • {r['code']} — {r['name']}" for r in rows[:10])
+            )
+        else:
+            exhibition_line = "No exhibitions yet. Tap Exhibitions → Add New Exhibition to get started."
+
     text = (
         "THE SEA ART GALLERY — ExhibitLedger THB\n\n"
-        "This is now a guided exhibition finance assistant. Tap a section below, then answer the bot's follow-up questions. "
-        "All financial reports remain THB-only, and receipts are staged for approval before they touch the P&L.\n\n"
-        f"Current working exhibition: {_current_exhibition(context)}"
+        "Tap /menu for the guided button workflow. All reports are THB-only.\n\n"
+        + exhibition_line
     )
     await update.message.reply_text(text, reply_markup=_main_menu_keyboard())
 
@@ -820,6 +1015,44 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await query.edit_message_text(_flow_prompt(flow_name, context), reply_markup=reply_markup)
             return
 
+        if data.startswith("artwork:"):
+            action = data.split(":", 1)[1]
+            if action == "register_options":
+                await query.edit_message_text(
+                    "Register artwork — choose input method:",
+                    reply_markup=_artwork_register_keyboard(),
+                )
+                return
+            if action == "bulk_import":
+                _set_flow(context, "bulk_artwork")
+                try:
+                    template_path = generate_artwork_template_xlsx()
+                    await query.edit_message_text(
+                        "Bulk artwork import:\n\n"
+                        "1. Download the template file below\n"
+                        "2. Fill in your artworks (delete the 3 sample rows)\n"
+                        "3. Upload the filled file back here\n\n"
+                        "Tip: artwork titles with special characters like & work fine in the Excel."
+                    )
+                    await query.message.reply_document(
+                        document=open(template_path, "rb"),
+                        filename="artwork_import_template.xlsx",
+                        caption="Fill this template and upload it back to register all artworks at once.",
+                    )
+                except Exception as exc:
+                    await query.message.reply_text(f"Could not generate template: {exc}")
+                return
+            if action == "edit_hint":
+                await query.edit_message_text(
+                    "To edit an artwork, use the command:\n\n"
+                    "/edit_artwork <ID> title New Title\n"
+                    "/edit_artwork <ID> artist New Artist Name\n"
+                    "/edit_artwork <ID> price 350000\n\n"
+                    "Check artwork IDs with List Artworks.",
+                    reply_markup=_artwork_menu_keyboard(),
+                )
+                return
+
         if data.startswith("useexh:"):
             code = normalize_code(data.split(":", 1)[1])
             ex = get_exhibition(code)
@@ -1121,6 +1354,27 @@ async def handle_text_expense(update: Update, context: ContextTypes.DEFAULT_TYPE
     if await _handle_guided_flow(update, context, text):
         return
 
+    # Smart detection: "Title | Artist | Price" typed outside a flow should never
+    # be treated as a receipt (this is what caused "In & Out" to be classified as income).
+    if text.count("|") == 2:
+        parts = _pipe_parts(text)
+        try:
+            price = _parse_float(parts[2], "price")
+            if price > 0 and parts[0].strip() and parts[1].strip():
+                # Looks like artwork data — route to artwork registration
+                _set_flow(context, "add_artwork")
+                row = add_artwork(_current_exhibition(context), parts[0], parts[1], price)
+                _clear_flow(context)
+                await update.message.reply_text(
+                    f"Artwork registered from your message.\n"
+                    f"ID: #{row['id']}\nTitle: {row['title']}\nArtist: {row['artist']}\nAsking Price: {money(row['asking_price_thb'])}\n\n"
+                    "If this was meant as an expense instead, use /pending to review receipts.",
+                    reply_markup=_artwork_menu_keyboard(),
+                )
+                return
+        except Exception:
+            pass  # Not a valid artwork pattern — fall through to receipt handling
+
     if parse_amount_thb(text) <= 0:
         await update.message.reply_text(
             "I did not find a THB amount. Tap /menu to choose an action, or record an expense by sending for example: "
@@ -1245,22 +1499,25 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 def _seed_shwedagon_if_missing() -> None:
-    """Seed the Shwe Dagon exhibition on first run if it is not already in the database."""
-    from exhibitledger import connect
+    """Seed the Shwe Dagon exhibition using raw sqlite3 — works even if exhibitledger path differs."""
     CODE = "SHWEDAGON2024"
     conversion_rate = float(os.environ.get("SEED_MMK_TO_THB_RATE", "0.006666666666666667"))
+    db_path = os.environ.get("DB_PATH", "./exhibitledger.db")
 
     def thb(mmk: float) -> float:
         return round(mmk * conversion_rate, 2)
 
-    with connect() as conn:
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    try:
         conn.execute(
             """INSERT INTO exhibitions
                (code, name, location, start_date, end_date, status, currency, notes)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (CODE, "Shwe Dagon Platform Exhibition", "Bangkok / Yangon logistics",
              "2024-09-01", "2024-09-28", "completed", "THB",
-             f"Auto-seeded from source Excel. MMK lines at rate={conversion_rate}. "
+             f"Auto-seeded. MMK lines at rate={conversion_rate}. "
              "Artist THB prices from Sheet2 artist list."),
         )
 
@@ -1291,7 +1548,6 @@ def _seed_shwedagon_if_missing() -> None:
                  "22ShweDagonPlatformEstimatedP&L-Sheet1", sort_order),
             )
 
-        # Artist payables — Sheet2 explicit THB prices, 50/50 commission split
         artists = [
             ("U Lu Min",            2,  126_000),
             ("Zaw Win Phay",        2,  133_000),
@@ -1342,9 +1598,16 @@ def _seed_shwedagon_if_missing() -> None:
         conn.execute(
             "INSERT INTO audit_log (timestamp, action, exhibition_code, details) VALUES (?, ?, ?, ?)",
             (datetime.utcnow().isoformat(timespec="seconds") + "Z",
-             "auto_seed_shwedagon", CODE,
-             f"{len(pnl_lines)} P&L lines + {len(artists)} artists seeded on startup."),
+             "seed_shwedagon", CODE,
+             f"{len(pnl_lines)} P&L lines + {len(artists)} artists seeded via raw sqlite3."),
         )
+        conn.commit()
+        logger.info("SHWEDAGON2024 seeded successfully into %s", db_path)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 async def reseed_shwedagon(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1383,6 +1646,7 @@ def build_application() -> Application:
     application = Application.builder().token(token).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("menu", menu_command))
+    application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("exhibitions", exhibitions))
@@ -1410,7 +1674,8 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("sync_preview", sync_preview))
     application.add_handler(CommandHandler("reseed_shwedagon", reseed_shwedagon))
     application.add_handler(CallbackQueryHandler(expense_callback, pattern=r"^expense:"))
-    application.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^(menu:|flow:|preset_split:|useexh:|quick:|report:)"))
+    application.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^(menu:|flow:|artwork:|preset_split:|useexh:|quick:|report:)"))
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_document_upload))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo_expense))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_expense))
 
