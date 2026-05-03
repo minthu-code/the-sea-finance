@@ -81,7 +81,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram.ext").setLevel(logging.INFO)
 
 
-DEFAULT_EXHIBITION = os.environ.get("DEFAULT_EXHIBITION", "SHWEDAGON2024")
+DEFAULT_EXHIBITION = re.sub(r"[^A-Z0-9_]", "", (os.environ.get("DEFAULT_EXHIBITION", "SHWEDAGON2024") or "SHWEDAGON2024").split()[0].upper()) or "SHWEDAGON2024"
 ALLOWED_SPLIT_TYPES = {"gallery", "artist", "collaborator", "collector"}
 
 
@@ -141,7 +141,10 @@ def start_render_health_server() -> None:
 
 
 def _current_exhibition(context: ContextTypes.DEFAULT_TYPE) -> str:
-    return context.user_data.get("current_exhibition") or DEFAULT_EXHIBITION
+    raw = context.user_data.get("current_exhibition") or DEFAULT_EXHIBITION
+    # Strip anything that isn't a valid exhibition code character
+    clean = re.sub(r"[^A-Z0-9_]", "", raw.split()[0].upper()) if raw else ""
+    return clean or DEFAULT_EXHIBITION
 
 
 def _get_code(context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -315,11 +318,15 @@ def _pending_keyboard(pending_id: int) -> InlineKeyboardMarkup:
 
 
 def _account_keyboard(pending_id: int) -> InlineKeyboardMarkup:
-    buttons = []
     names = account_head_names()
-    for idx, name in enumerate(names):
-        buttons.append([InlineKeyboardButton(name[:60], callback_data=f"expense:setacct:{pending_id}:{idx}")])
-    buttons.append([InlineKeyboardButton("Back", callback_data=f"expense:back:{pending_id}")])
+    buttons = []
+    # Pair account heads two per row so the list isn't endless
+    for i in range(0, len(names), 2):
+        row = [InlineKeyboardButton(names[i][:40], callback_data=f"expense:setacct:{pending_id}:{i}")]
+        if i + 1 < len(names):
+            row.append(InlineKeyboardButton(names[i + 1][:40], callback_data=f"expense:setacct:{pending_id}:{i + 1}"))
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("← Back", callback_data=f"expense:back:{pending_id}")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -445,10 +452,13 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
         )
         return
 
-    # Only process if user flagged this as artwork import (or if file is named like the template)
-    if not (context.user_data.get("flow", {}).get("name") == "bulk_artwork"
-            or "artwork" in fname.lower() or "import" in fname.lower()):
-        return  # Not for us — ignore other Excel uploads
+    # Only process artwork imports when the user explicitly started the bulk import flow.
+    # Also accept if the file is named exactly like our template (user saved and re-uploaded it).
+    in_bulk_flow = context.user_data.get("flow", {}).get("name") == "bulk_artwork"
+    is_template_file = fname.lower() in {"artwork_import_template.xlsx", "artwork_import_template.xls"}
+    if not in_bulk_flow and not is_template_file:
+        # Silently ignore other Excel uploads — don't confuse the user
+        return
 
     await update.message.reply_text("Reading Excel file... please wait.")
     _clear_flow(context)
@@ -526,8 +536,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 await update.message.reply_text("No exhibitions found. Create one first via /menu.")
             return
 
-        from exhibitledger import connect as _conn
-        with _conn() as conn:
+        with connect() as conn:
             artworks_total = conn.execute("SELECT COUNT(*) FROM artworks WHERE exhibition_code=?", (code,)).fetchone()[0]
             artworks_sold = conn.execute("SELECT COUNT(*) FROM artworks WHERE exhibition_code=? AND status='sold'", (code,)).fetchone()[0]
             pending_count = conn.execute("SELECT COUNT(*) FROM pending_expenses WHERE exhibition_code=? AND status='pending'", (code,)).fetchone()[0]
@@ -561,20 +570,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if ex:
         exhibition_line = f"Current working exhibition: {code} — {ex['name']}"
     else:
-        # Context was wiped (redeploy) or no exhibition set yet
+        # Context was wiped (redeploy) — try to restore most recently created exhibition
         rows = list_exhibitions()
         if rows:
+            # Auto-set to the most recently created exhibition (last in list)
+            latest = rows[-1]
+            _set_current_exhibition(context, latest["code"])
             exhibition_line = (
-                "⚠️ Your active exhibition was reset (this happens after bot updates).\n"
-                "Use /use <CODE> or tap Exhibitions → Switch Exhibition to reselect.\n\n"
-                "Your exhibitions:\n" + "\n".join(f"  • {r['code']} — {r['name']}" for r in rows[:10])
+                f"⚠️ Session reset after update. Auto-switched to your most recent exhibition:\n"
+                f"{latest['code']} — {latest['name']}\n\n"
+                "All your exhibitions:\n"
+                + "\n".join(f"  • {r['code']} — {r['name']}" for r in rows[:10])
+                + "\n\nUse /use <CODE> to switch to a different one."
             )
         else:
             exhibition_line = "No exhibitions yet. Tap Exhibitions → Add New Exhibition to get started."
 
     text = (
         "THE SEA ART GALLERY — ExhibitLedger THB\n\n"
-        "Tap /menu for the guided button workflow. All reports are THB-only.\n\n"
+        "Tap /menu for the guided workflow. All reports in THB.\n\n"
         + exhibition_line
     )
     await update.message.reply_text(text, reply_markup=_main_menu_keyboard())
@@ -582,7 +596,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _clear_flow(context)
-    await update.message.reply_text(f"Main menu. Current exhibition: {_current_exhibition(context)}", reply_markup=_main_menu_keyboard())
+    code = _current_exhibition(context)
+    ex = get_exhibition(code)
+    label = f"{code} — {ex['name']}" if ex else code
+    await update.message.reply_text(f"Main menu. Current exhibition: {label}", reply_markup=_main_menu_keyboard())
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -629,6 +646,8 @@ def _command_guide_text() -> str:
         "/edit_artwork <ID> title <NEW TITLE>\n"
         "/edit_artwork <ID> artist <NEW ARTIST NAME>\n"
         "/edit_artwork <ID> price <NEW PRICE THB>\n\n"
+        "Artist payments:\n"
+        "/pay_artist <CODE> <ARTIST NAME> <AMOUNT THB>\n\n"
         "Google Sheets commands remain read-only and optional: /sheets_status and /sync_preview. Use /cancel at any time to stop a guided action."
     )
 
@@ -919,10 +938,81 @@ async def export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         export_dir = os.environ.get("EXPORT_DIR", "./exports")
         file_path = export_report_xlsx(code, export_dir)
-        await update.message.reply_document(document=open(file_path, "rb"), filename=Path(file_path).name)
+        with open(file_path, "rb") as f:
+            await update.message.reply_document(document=f, filename=Path(file_path).name)
     except Exception as exc:
         logger.exception("Failed to export report")
         await update.message.reply_text(f"Could not export report for {code}: {exc}")
+
+
+async def pay_artist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Mark an artist payable as paid (partially or in full).
+
+    Usage:
+        /pay_artist <EXHIBITION_CODE> <ARTIST_NAME> <AMOUNT_THB>
+    Example:
+        /pay_artist SHWEDAGON2024 "Aye Nyein Myint" 25000
+        /pay_artist CLASH090526 "Aung Myint" 50000
+    """
+    try:
+        if len(context.args) < 3:
+            raise ValueError(
+                "Usage: /pay_artist <CODE> <ARTIST NAME> <AMOUNT THB>\n"
+                "Example: /pay_artist SHWEDAGON2024 \"U Lu Min\" 126000\n\n"
+                "Use /artist_payouts <CODE> to see outstanding amounts."
+            )
+        code = normalize_code(context.args[0])
+        # Last arg is amount, everything between code and amount is artist name
+        amount = _parse_float(context.args[-1], "Payment amount")
+        artist_name = " ".join(context.args[1:-1]).strip().strip('"').strip("'")
+        if not artist_name:
+            raise ValueError("Artist name cannot be empty.")
+        if amount <= 0:
+            raise ValueError("Payment amount must be greater than zero.")
+
+        with connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM artist_payables WHERE exhibition_code=? AND LOWER(artist)=LOWER(?)",
+                (code, artist_name),
+            ).fetchone()
+            if not row:
+                # Try partial match
+                row = conn.execute(
+                    "SELECT * FROM artist_payables WHERE exhibition_code=? AND LOWER(artist) LIKE LOWER(?)",
+                    (code, f"%{artist_name}%"),
+                ).fetchone()
+            if not row:
+                raise ValueError(
+                    f"Artist '{artist_name}' not found in {code}.\n"
+                    f"Use /artist_payouts {code} to see exact artist names."
+                )
+            row = dict(row)
+            new_paid = round(row["paid_thb"] + amount, 2)
+            new_outstanding = round(row["artist_payable_thb"] - new_paid, 2)
+            if new_paid > row["artist_payable_thb"]:
+                raise ValueError(
+                    f"Payment of {money(amount)} exceeds outstanding amount of {money(row['outstanding_thb'])}.\n"
+                    "If this is intentional, adjust the artist payable first."
+                )
+            new_status = "Paid" if new_outstanding <= 0 else "Partial"
+            conn.execute(
+                "UPDATE artist_payables SET paid_thb=?, outstanding_thb=?, status=? WHERE id=?",
+                (new_paid, max(new_outstanding, 0), new_status, row["id"]),
+            )
+            log_action("pay_artist", code, f"Paid {money(amount)} to {row['artist']}. Paid: {money(new_paid)}, Outstanding: {money(max(new_outstanding, 0))}")
+
+        lines = [
+            f"Payment recorded for {row['artist']}.",
+            f"Exhibition: {code}",
+            f"This payment: {money(amount)}",
+            f"Total paid: {money(new_paid)} / {money(row['artist_payable_thb'])}",
+            f"Outstanding: {money(max(new_outstanding, 0))}",
+            f"Status: {new_status}",
+        ]
+        await update.message.reply_text("\n".join(lines), reply_markup=_reports_menu_keyboard())
+    except Exception as exc:
+        logger.exception("Failed to record artist payment")
+        await update.message.reply_text(f"Could not record payment: {exc}")
 
 
 async def sheets_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -956,15 +1046,47 @@ async def sync_preview(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 def _flow_prompt(flow_name: str, context: ContextTypes.DEFAULT_TYPE) -> str:
     code = _current_exhibition(context)
     prompts = {
-        "new_exhibition": "Add new exhibition. Send: CODE | Name | Location | Start date | End date | Notes\nOnly CODE | Name is required.",
+        "new_exhibition": (
+            "Add new exhibition.\n"
+            "Send: CODE | Name | Location | Start date | End date | Notes\n"
+            "Only CODE | Name is required.\n"
+            "Example: BKK2027 | Bangkok Art Fair 2027 | Bangkok | 2027-03-01 | 2027-03-15"
+        ),
         "use_exhibition": "Switch exhibition. Send the exhibition code, or tap one below.",
-        "custom_split": f"Set custom split for {code}. Send: gallery 45 collaborator Curator 10 artist 45\nPercentages must total 100%.",
-        "add_artwork": f"Register artwork for {code}. Send: Title | Artist | Asking Price THB",
-        "record_sale": "Record sale. Send: Artwork ID | Sale Price | Buyer | Collected Amount | Payment Method | Notes\nOnly Artwork ID and Sale Price are required.",
-        "text_receipt": f"Add text receipt for {code}. Send: Amount Description\nExample: 3500 coffee and snacks opening night",
-        "set_budget": f"Set budget for {code}. Send: Account Head | Amount THB\nYou may use the account number from /accounts.",
+        "custom_split": (
+            f"Set custom split for {code}.\n"
+            "Send: gallery <pct> collaborator <name> <pct> artist <pct>\n"
+            "Example: gallery 45 collaborator Supples 25 artist 30\n"
+            "Percentages must total 100%."
+        ),
+        "add_artwork": (
+            f"Register artwork for {code}.\n"
+            "Send: Title | Artist | Asking Price THB\n"
+            "Example: In & Out | Aung Myint | 304000"
+        ),
+        "record_sale": (
+            "Record sale.\n"
+            "Send: Artwork ID | Sale Price | Buyer | Collected Amount | Payment Method | Notes\n"
+            "Only Artwork ID and Sale Price are required.\n"
+            "Example: 3 | 304000 | John Smith | 150000 | Bank Transfer | Balance due June"
+        ),
+        "text_receipt": (
+            f"Add text receipt for {code}.\n"
+            "Send: Amount Description\n"
+            "Example: 3500 coffee and snacks opening night"
+        ),
+        "set_budget": (
+            f"Set budget for {code}.\n"
+            "Send: Account Head | Amount THB\n"
+            "You may use the account number from /accounts.\n"
+            "Example: Venue Rental | 50000"
+        ),
+        "bulk_artwork": (
+            "Upload the filled Excel template to register all artworks at once.\n"
+            "Use /cancel if you want to stop."
+        ),
     }
-    return prompts[flow_name]
+    return prompts.get(flow_name, f"Guided action: {flow_name}. Send your input or use /cancel to stop.")
 
 
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -981,31 +1103,49 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     try:
         if data == "menu:home":
             _clear_flow(context)
-            await query.edit_message_text(f"Main menu. Current exhibition: {_current_exhibition(context)}", reply_markup=_main_menu_keyboard())
+            code = _current_exhibition(context)
+            ex = get_exhibition(code)
+            label = f"{code} — {ex['name']}" if ex else code
+            await query.edit_message_text(f"Main menu. Current exhibition: {label}", reply_markup=_main_menu_keyboard())
             return
         if data == "menu:exhibitions":
             _clear_flow(context)
-            await query.edit_message_text(f"Exhibition menu. Current: {_current_exhibition(context)}", reply_markup=_exhibition_menu_keyboard())
+            code = _current_exhibition(context)
+            ex = get_exhibition(code)
+            label = f"{code} — {ex['name']}" if ex else code
+            await query.edit_message_text(f"Exhibitions. Current: {label}", reply_markup=_exhibition_menu_keyboard())
             return
         if data == "menu:splits":
             _clear_flow(context)
-            await query.edit_message_text(f"Commission split menu. Current exhibition: {_current_exhibition(context)}", reply_markup=_split_menu_keyboard())
+            code = _current_exhibition(context)
+            ex = get_exhibition(code)
+            label = f"{code} — {ex['name']}" if ex else code
+            await query.edit_message_text(f"Commission splits. Current exhibition: {label}", reply_markup=_split_menu_keyboard())
             return
         if data == "menu:artworks":
             _clear_flow(context)
-            await query.edit_message_text(f"Artworks and sales menu. Current exhibition: {_current_exhibition(context)}", reply_markup=_artwork_menu_keyboard())
+            code = _current_exhibition(context)
+            ex = get_exhibition(code)
+            label = f"{code} — {ex['name']}" if ex else code
+            await query.edit_message_text(f"Artworks and sales. Current exhibition: {label}", reply_markup=_artwork_menu_keyboard())
             return
         if data == "menu:expenses":
             _clear_flow(context)
-            await query.edit_message_text(f"Receipts and expenses menu. Current exhibition: {_current_exhibition(context)}", reply_markup=_expense_menu_keyboard())
+            code = _current_exhibition(context)
+            ex = get_exhibition(code)
+            label = f"{code} — {ex['name']}" if ex else code
+            await query.edit_message_text(f"Receipts and expenses. Current exhibition: {label}", reply_markup=_expense_menu_keyboard())
             return
         if data == "menu:reports":
             _clear_flow(context)
-            await query.edit_message_text(f"Reports and export menu. Current exhibition: {_current_exhibition(context)}", reply_markup=_reports_menu_keyboard())
+            code = _current_exhibition(context)
+            ex = get_exhibition(code)
+            label = f"{code} — {ex['name']}" if ex else code
+            await query.edit_message_text(f"Reports and export. Current exhibition: {label}", reply_markup=_reports_menu_keyboard())
             return
         if data == "menu:help":
             _clear_flow(context)
-            await query.edit_message_text("Help and settings menu.", reply_markup=_help_menu_keyboard())
+            await query.edit_message_text("Help and settings.", reply_markup=_help_menu_keyboard())
             return
 
         if data.startswith("flow:"):
@@ -1030,15 +1170,16 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                     await query.edit_message_text(
                         "Bulk artwork import:\n\n"
                         "1. Download the template file below\n"
-                        "2. Fill in your artworks (delete the 3 sample rows)\n"
-                        "3. Upload the filled file back here\n\n"
-                        "Tip: artwork titles with special characters like & work fine in the Excel."
+                        "2. Fill in your artworks (delete the 3 sample rows first)\n"
+                        "3. Upload the filled file back to this chat\n\n"
+                        "Artwork titles with special characters like & work fine."
                     )
-                    await query.message.reply_document(
-                        document=open(template_path, "rb"),
-                        filename="artwork_import_template.xlsx",
-                        caption="Fill this template and upload it back to register all artworks at once.",
-                    )
+                    with open(template_path, "rb") as f:
+                        await query.message.reply_document(
+                            document=f,
+                            filename="artwork_import_template.xlsx",
+                            caption="Fill this in and upload it back here to register all artworks at once.",
+                        )
                 except Exception as exc:
                     await query.message.reply_text(f"Could not generate template: {exc}")
                 return
@@ -1104,11 +1245,14 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
         raise ValueError(f"Unknown menu action: {data}")
     except Exception as exc:
-        logger.exception("Menu callback failed")
+        logger.exception("Menu callback failed for data=%s", data)
         try:
             await query.edit_message_text(f"Could not complete action: {exc}", reply_markup=_main_menu_keyboard())
         except Exception:
-            pass
+            try:
+                await query.message.reply_text(f"Could not complete action: {exc}", reply_markup=_main_menu_keyboard())
+            except Exception:
+                pass
 
 
 async def _handle_report_callback(query, context: ContextTypes.DEFAULT_TYPE, report_name: str) -> None:
@@ -1163,7 +1307,8 @@ async def _handle_report_callback(query, context: ContextTypes.DEFAULT_TYPE, rep
         await query.edit_message_text(f"Preparing Excel export for {code}...")
         export_dir = os.environ.get("EXPORT_DIR", "./exports")
         file_path = export_report_xlsx(code, export_dir)
-        await query.message.reply_document(document=open(file_path, "rb"), filename=Path(file_path).name)
+        with open(file_path, "rb") as f:
+            await query.message.reply_document(document=f, filename=Path(file_path).name)
         await query.message.reply_text("Export complete.", reply_markup=_reports_menu_keyboard())
         return
     elif report_name == "sheets_status":
@@ -1256,6 +1401,14 @@ async def _handle_guided_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
             _clear_flow(context)
             await update.message.reply_text(format_budget_report_markdown(_current_exhibition(context)), parse_mode=ParseMode.MARKDOWN, reply_markup=_reports_menu_keyboard())
             return True
+
+        if flow_name == "bulk_artwork":
+            # User typed text while in bulk mode — remind them to upload the Excel file
+            await update.message.reply_text(
+                "I'm waiting for you to upload the filled Excel template.\n\n"
+                "Please attach the .xlsx file. Use /cancel to stop."
+            )
+            return True
     except Exception as exc:
         await update.message.reply_text(f"Could not complete guided action: {exc}\n\n{_flow_prompt(flow_name, context)}")
         return True
@@ -1330,7 +1483,10 @@ async def expense_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         try:
             await query.edit_message_text(f"Could not update receipt: {exc}", reply_markup=_expense_menu_keyboard())
         except Exception:
-            pass
+            try:
+                await query.message.reply_text(f"Could not update receipt: {exc}", reply_markup=_expense_menu_keyboard())
+            except Exception:
+                pass
 
 
 async def handle_text_expense(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1454,7 +1610,10 @@ async def handle_photo_expense(update: Update, context: ContextTypes.DEFAULT_TYP
         pending = create_pending_expense(code, raw_text, photo_file_id=photo_file_id)
 
         # Delete status message and send result
-        await status_msg.delete()
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass  # Delete is cosmetic — don't crash if it fails
         await update.message.reply_text(
             format_pending_expense_card(pending),
             reply_markup=_pending_keyboard(pending["id"])
@@ -1470,25 +1629,26 @@ async def handle_photo_expense(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Log the error and send a telegram message to notify the developer."""
+    """Log errors and notify the user where possible."""
     logger.error("Exception while handling an update:", exc_info=context.error)
 
-    # Handle specific errors
-    if isinstance(context.error, Conflict):
-        logger.error("Conflict error: another bot instance is running.")
-        return
-    if isinstance(context.error, NetworkError):
-        logger.error("Network error occurred.")
-        return
-    if isinstance(context.error, Forbidden):
-        logger.error("Bot was blocked by the user.")
+    # These are network/infrastructure errors — no user message needed
+    if isinstance(context.error, (Conflict, NetworkError, TimedOut)):
+        if isinstance(context.error, Conflict):
+            logger.error("Conflict: another bot instance may be running.")
         return
 
-    # Notify user if possible
+    # Bot was blocked — nothing to do
+    if isinstance(context.error, Forbidden):
+        logger.warning("Bot was blocked by the user.")
+        return
+
+    # For all other errors, try to notify the user
     if isinstance(update, Update) and update.effective_message:
-        text = "Sorry, an unexpected error occurred. I've logged it and will look into it."
         try:
-            await update.effective_message.reply_text(text)
+            await update.effective_message.reply_text(
+                "Something went wrong. Please try again or tap /menu to restart."
+            )
         except Exception:
             pass
 
@@ -1614,15 +1774,20 @@ async def reseed_shwedagon(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     """Force a full reseed of SHWEDAGON2024 — wipes old data and reloads all 26 artists."""
     await update.message.reply_text("Reseeding SHWEDAGON2024... please wait.")
     try:
-        with connect() as conn:
-            conn.execute("DELETE FROM artist_payables WHERE exhibition_code = 'SHWEDAGON2024'")
-            conn.execute("DELETE FROM pnl_lines WHERE exhibition_code = 'SHWEDAGON2024'")
-            conn.execute("DELETE FROM exhibitions WHERE code = 'SHWEDAGON2024'")
+        db_path = os.environ.get("DB_PATH", "./exhibitledger.db")
+        raw_conn = sqlite3.connect(db_path)
+        try:
+            raw_conn.execute("DELETE FROM artist_payables WHERE exhibition_code = 'SHWEDAGON2024'")
+            raw_conn.execute("DELETE FROM pnl_lines WHERE exhibition_code = 'SHWEDAGON2024'")
+            raw_conn.execute("DELETE FROM exhibitions WHERE code = 'SHWEDAGON2024'")
+            raw_conn.commit()
+        finally:
+            raw_conn.close()
         _seed_shwedagon_if_missing()
         await update.message.reply_text(
             "SHWEDAGON2024 reseeded successfully.\n"
-            "26 artists and all P&L lines are now loaded.\n"
-            "Use /export SHWEDAGON2024 to get the Excel report."
+            "26 artists and all P&L lines are now loaded.\n\n"
+            "Use /export SHWEDAGON2024 to get the full Excel report."
         )
     except Exception as exc:
         logger.exception("Reseed failed")
@@ -1635,13 +1800,34 @@ def build_application() -> Application:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set. Create a bot with BotFather and set the token first.")
     init_db()
 
-    # Auto-seed SHWEDAGON2024 once on first deploy if not already present.
+    # Auto-seed SHWEDAGON2024 on startup if missing or incomplete (< 5 artists = bad old seed).
     try:
-        if not get_exhibition("SHWEDAGON2024"):
+        db_path = os.environ.get("DB_PATH", "./exhibitledger.db")
+        _raw = sqlite3.connect(db_path)
+        try:
+            _ex = _raw.execute("SELECT code FROM exhibitions WHERE code='SHWEDAGON2024'").fetchone()
+            _artist_count = _raw.execute(
+                "SELECT COUNT(*) FROM artist_payables WHERE exhibition_code='SHWEDAGON2024'"
+            ).fetchone()[0]
+            if not _ex or _artist_count < 5:
+                # Delete stale/partial data in the same connection before reseeding
+                _raw.execute("DELETE FROM artist_payables WHERE exhibition_code='SHWEDAGON2024'")
+                _raw.execute("DELETE FROM pnl_lines WHERE exhibition_code='SHWEDAGON2024'")
+                _raw.execute("DELETE FROM exhibitions WHERE code='SHWEDAGON2024'")
+                _raw.commit()
+                _needs_seed = True
+            else:
+                _needs_seed = False
+        finally:
+            _raw.close()
+
+        if _needs_seed:
             _seed_shwedagon_if_missing()
-            logger.info("Auto-seeded SHWEDAGON2024 on startup.")
+            logger.info("SHWEDAGON2024 seeded/reseeded on startup (had %d artists).", _artist_count if _ex else 0)
+        else:
+            logger.info("SHWEDAGON2024 already present with %d artists — skipping seed.", _artist_count)
     except Exception as _seed_err:
-        logger.warning("Could not auto-seed SHWEDAGON2024: %s", _seed_err)
+        logger.warning("Could not check/seed SHWEDAGON2024 on startup: %s", _seed_err)
 
     application = Application.builder().token(token).build()
     application.add_handler(CommandHandler("start", start))
@@ -1667,6 +1853,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("summary", summary))
     application.add_handler(CommandHandler("pl", pl))
     application.add_handler(CommandHandler("artist_payouts", artist_payouts))
+    application.add_handler(CommandHandler("pay_artist", pay_artist))
     application.add_handler(CommandHandler("readiness", readiness))
     application.add_handler(CommandHandler("data_check", data_check))
     application.add_handler(CommandHandler("export", export))
