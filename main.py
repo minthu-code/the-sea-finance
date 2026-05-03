@@ -440,27 +440,50 @@ def generate_artwork_template_xlsx() -> str:
 
 
 async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle Excel file uploads for bulk artwork import."""
+    """Handle Excel file uploads for bulk artwork import.
+
+    Accepts the file if:
+    - The bulk_artwork flow is active (user tapped Bulk Import then uploaded), OR
+    - The file is named like our template (user filled it in and sent it back), OR
+    - The file is any .xlsx and no other flow is active (user uploaded directly without going through menu).
+
+    Never ignores silently — always replies so the user knows what happened.
+    """
     doc = update.message.document
     if not doc:
         return
+
     fname = doc.file_name or ""
     if not fname.lower().endswith((".xlsx", ".xls")):
-        await update.message.reply_text(
-            "Please upload an Excel file (.xlsx) using the artwork import template.\n"
-            "Tap Menu → Artworks & Sales → Register Artwork → Bulk Import to get the template."
-        )
+        # Only respond if there's a bulk flow active — otherwise silently ignore non-Excel docs
+        if context.user_data.get("flow", {}).get("name") == "bulk_artwork":
+            await update.message.reply_text(
+                "Please upload an Excel (.xlsx) file, not this file type.\n"
+                "Use the template sent above, fill it in, and upload it back."
+            )
         return
 
-    # Only process artwork imports when the user explicitly started the bulk import flow.
-    # Also accept if the file is named exactly like our template (user saved and re-uploaded it).
     in_bulk_flow = context.user_data.get("flow", {}).get("name") == "bulk_artwork"
-    is_template_file = fname.lower() in {"artwork_import_template.xlsx", "artwork_import_template.xls"}
-    if not in_bulk_flow and not is_template_file:
-        # Silently ignore other Excel uploads — don't confuse the user
+    is_template_name = "artwork_import_template" in fname.lower()
+    any_other_flow = context.user_data.get("flow", {}).get("name") not in {None, "bulk_artwork"}
+
+    # Ignore if user is mid-way through a completely different flow (e.g. adding an exhibition)
+    if any_other_flow:
         return
 
-    await update.message.reply_text("Reading Excel file... please wait.")
+    # If none of our signals match — still accept it and try, because the user clearly
+    # intended to send an artwork file. Don't leave them hanging silently.
+    # Worst case: it fails gracefully and tells them what went wrong.
+
+    code = _current_exhibition(context)
+    ex = get_exhibition(code)
+
+    # Always acknowledge immediately so the user knows the bot received the file
+    await update.message.reply_text(
+        f"Received {fname}. Processing artwork import for {code}"
+        + (f" — {ex['name']}" if ex else "")
+        + "..."
+    )
     _clear_flow(context)
 
     try:
@@ -473,48 +496,69 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
         ws = wb.active
         rows = list(ws.iter_rows(min_row=2, values_only=True))  # skip header row
 
-        code = _current_exhibition(context)
         registered = []
         skipped = []
+        sample_titles = {"Red Eye Balls", "In & Out", "Morning Light"}  # template sample rows
 
         for i, row in enumerate(rows, start=2):
             if not row or all(v is None or str(v).strip() == "" for v in row):
                 continue  # blank row
+
             title = str(row[0]).strip() if row[0] is not None else ""
             artist = str(row[1]).strip() if len(row) > 1 and row[1] is not None else ""
             price_raw = row[2] if len(row) > 2 else None
-            notes = str(row[3]).strip() if len(row) > 3 and row[3] is not None else ""
+
+            # Skip the sample rows from the template so user doesn't have to delete them
+            if title in sample_titles and artist in {"Aung Myint", "Artist Name"}:
+                skipped.append(f"Row {i} ({title}): skipped sample row — please replace with your real artworks")
+                continue
 
             if not title or not artist:
-                skipped.append(f"Row {i}: missing title or artist")
+                skipped.append(f"Row {i}: missing title or artist name")
                 continue
+
             try:
                 price = float(str(price_raw).replace(",", "").strip())
                 if price <= 0:
-                    raise ValueError("Price must be greater than 0")
+                    raise ValueError("price must be greater than zero")
             except Exception:
-                skipped.append(f"Row {i} ({title}): invalid price '{price_raw}'")
+                skipped.append(f"Row {i} ({title}): invalid price '{price_raw}' — must be a number like 120000")
                 continue
 
             try:
                 artwork_row = add_artwork(code, title, artist, price)
-                registered.append(f"#{artwork_row['id']} {title} — {artist} — {money(price)}")
+                registered.append(f"#{artwork_row['id']}  {title}  |  {artist}  |  {money(price)}")
             except Exception as exc:
                 skipped.append(f"Row {i} ({title}): {exc}")
 
-        lines = [f"Bulk import complete for {code}.", f"", f"Registered {len(registered)} artwork(s):"]
-        lines.extend(f"  ✅ {r}" for r in registered)
+        if not registered and not skipped:
+            await update.message.reply_text(
+                "The file appears to be empty or only contains the header row.\n\n"
+                "Make sure you filled in your artworks below the header row and saved the file before uploading.",
+                reply_markup=_artwork_menu_keyboard(),
+            )
+            return
+
+        lines = [f"Bulk import complete — {code}", ""]
+        if registered:
+            lines.append(f"Registered {len(registered)} artwork(s):")
+            lines.extend(f"  ✅ {r}" for r in registered)
         if skipped:
-            lines.append(f"")
+            if registered:
+                lines.append("")
             lines.append(f"Skipped {len(skipped)} row(s):")
             lines.extend(f"  ⚠️ {s}" for s in skipped)
+        if registered:
+            lines += ["", "Use List Artworks to confirm or /export to generate the full report."]
 
         await update.message.reply_text("\n".join(lines), reply_markup=_artwork_menu_keyboard())
 
     except Exception as exc:
         logger.exception("Bulk artwork import failed")
         await update.message.reply_text(
-            f"Could not read the Excel file: {exc}\n\nMake sure you used the artwork import template."
+            f"Could not read the file: {exc}\n\n"
+            "Make sure the file is a valid .xlsx and uses the artwork import template format.\n"
+            "Tap Bulk Import again to get a fresh template."
         )
 
 
