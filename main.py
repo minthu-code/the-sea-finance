@@ -407,11 +407,11 @@ def generate_artwork_template_xlsx() -> str:
         cell.fill = header_fill
         cell.alignment = Alignment(horizontal="center")
 
-    # Sample rows so the user understands the format
+    # Sample rows so the user understands the format — use obviously fake names
+    # so real artworks are never accidentally skipped
     samples = [
-        ["Red Eye Balls", "Aung Myint", 400000, ""],
-        ["In & Out", "Aung Myint", 304000, "Special framing required"],
-        ["Morning Light", "Artist Name", 120000, ""],
+        ["Sample Title 1 (delete this row)", "Sample Artist (delete this row)", 100000, ""],
+        ["Sample Title 2 (delete this row)", "Sample Artist (delete this row)", 250000, "Replace these rows with your real artworks"],
     ]
     for row in samples:
         ws.append(row)
@@ -498,7 +498,6 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
 
         registered = []
         skipped = []
-        sample_titles = {"Red Eye Balls", "In & Out", "Morning Light"}  # template sample rows
 
         for i, row in enumerate(rows, start=2):
             if not row or all(v is None or str(v).strip() == "" for v in row):
@@ -508,9 +507,9 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
             artist = str(row[1]).strip() if len(row) > 1 and row[1] is not None else ""
             price_raw = row[2] if len(row) > 2 else None
 
-            # Skip the sample rows from the template so user doesn't have to delete them
-            if title in sample_titles and artist in {"Aung Myint", "Artist Name"}:
-                skipped.append(f"Row {i} ({title}): skipped sample row — please replace with your real artworks")
+            # Skip the sample placeholder rows from the template
+            if "delete this row" in title.lower() or "delete this row" in artist.lower():
+                skipped.append(f"Row {i} ({title}): skipped placeholder row")
                 continue
 
             if not title or not artist:
