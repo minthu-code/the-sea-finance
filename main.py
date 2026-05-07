@@ -82,6 +82,36 @@ logging.getLogger("telegram.ext").setLevel(logging.INFO)
 
 
 DEFAULT_EXHIBITION = re.sub(r"[^A-Z0-9_]", "", (os.environ.get("DEFAULT_EXHIBITION", "SHWEDAGON2024") or "SHWEDAGON2024").split()[0].upper()) or "SHWEDAGON2024"
+
+
+def _resolve_default_exhibition() -> str:
+    """Return the best default exhibition code.
+
+    Priority:
+    1. Most recently active non-prototype exhibition in the DB
+    2. Any exhibition in the DB
+    3. ENV DEFAULT_EXHIBITION fallback
+    """
+    try:
+        db_path = os.environ.get("DB_PATH", "./exhibitledger.db")
+        conn = sqlite3.connect(db_path)
+        try:
+            # Prefer active exhibitions, newest first
+            row = conn.execute(
+                "SELECT code FROM exhibitions WHERE status NOT IN ('prototype') "
+                "ORDER BY COALESCE(end_date, start_date, '9999') DESC, code LIMIT 1"
+            ).fetchone()
+            if row:
+                return row[0]
+            # Fallback: any exhibition
+            row = conn.execute("SELECT code FROM exhibitions ORDER BY rowid DESC LIMIT 1").fetchone()
+            if row:
+                return row[0]
+        finally:
+            conn.close()
+    except Exception:
+        pass
+    return DEFAULT_EXHIBITION
 ALLOWED_SPLIT_TYPES = {"gallery", "artist", "collaborator", "collector"}
 
 
@@ -141,10 +171,13 @@ def start_render_health_server() -> None:
 
 
 def _current_exhibition(context: ContextTypes.DEFAULT_TYPE) -> str:
-    raw = context.user_data.get("current_exhibition") or DEFAULT_EXHIBITION
-    # Strip anything that isn't a valid exhibition code character
-    clean = re.sub(r"[^A-Z0-9_]", "", raw.split()[0].upper()) if raw else ""
-    return clean or DEFAULT_EXHIBITION
+    raw = context.user_data.get("current_exhibition") or ""
+    if raw:
+        clean = re.sub(r"[^A-Z0-9_]", "", raw.split()[0].upper())
+        if clean:
+            return clean
+    # Context is empty (fresh start or redeploy) — resolve from DB
+    return _resolve_default_exhibition()
 
 
 def _get_code(context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -1683,10 +1716,20 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.error("Exception while handling an update:", exc_info=context.error)
 
     # These are network/infrastructure errors — no user message needed
-    if isinstance(context.error, (Conflict, NetworkError, TimedOut)):
-        if isinstance(context.error, Conflict):
-            logger.error("Conflict: another bot instance may be running.")
+    if isinstance(context.error, TimedOut):
+        logger.warning("Telegram request timed out — will retry automatically.")
         return
+    if isinstance(context.error, NetworkError):
+        logger.warning("Network error: %s — will retry.", context.error)
+        return
+    if isinstance(context.error, Conflict):
+        # Another instance is already running. Stop this one immediately.
+        logger.critical(
+            "CONFLICT: Another bot instance is already running. "
+            "This instance will shut down to avoid duplicate responses. "
+            "Check Render for duplicate deployments."
+        )
+        os._exit(1)  # Hard stop — let Render restart cleanly
 
     # Bot was blocked — nothing to do
     if isinstance(context.error, Forbidden):
@@ -1926,7 +1969,11 @@ def main() -> None:
     start_render_health_server()
     app = build_application()
     logger.info("Starting ExhibitLedger THB bot in polling mode")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,   # Clear any updates that piled up during restart
+        close_loop=False,
+    )
 
 
 if __name__ == "__main__":

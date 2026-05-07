@@ -15,7 +15,7 @@ services:
       - key: DB_PATH
         value: /data/exhibitledger.db
       - key: DEFAULT_EXHIBITION
-        value: SHWEDAGON2024
+        value: CLASH090526
       - key: EXPORT_DIR
         value: /data/exports
       - key: SEED_MMK_TO_THB_RATE
