@@ -1971,8 +1971,7 @@ def main() -> None:
     logger.info("Starting ExhibitLedger THB bot in polling mode")
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,   # Clear any updates that piled up during restart
-        close_loop=False,
+        drop_pending_updates=True,
     )
 
 
