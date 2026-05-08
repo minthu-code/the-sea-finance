@@ -1723,13 +1723,15 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
         logger.warning("Network error: %s — will retry.", context.error)
         return
     if isinstance(context.error, Conflict):
-        # Another instance is already running. Stop this one immediately.
-        logger.critical(
-            "CONFLICT: Another bot instance is already running. "
-            "This instance will shut down to avoid duplicate responses. "
-            "Check Render for duplicate deployments."
+        # Another instance is polling — this happens briefly during Render rolling deploys.
+        # Log it and let python-telegram-bot's built-in retry logic handle it.
+        # The old instance will stop within ~30 seconds and polling will resume normally.
+        logger.warning(
+            "Conflict detected: another bot instance is polling. "
+            "This resolves automatically when the old Render instance stops. "
+            "If this persists for more than 2 minutes, check Render for duplicate services."
         )
-        os._exit(1)  # Hard stop — let Render restart cleanly
+        return
 
     # Bot was blocked — nothing to do
     if isinstance(context.error, Forbidden):
