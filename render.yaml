@@ -22,3 +22,13 @@ services:
         sync: false
       - key: LOG_LEVEL
         value: INFO
+      - key: RENDER_EXTERNAL_URL
+        fromService:
+          type: web
+          name: the-sea-finance-bot
+          property: host
+      - key: BACKUP_CHAT_ID
+        sync: false
+      - key: POLLING
+        value: "false"
+

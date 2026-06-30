@@ -288,6 +288,15 @@ def init_db(path: str | None = None) -> None:
                 UNIQUE(exhibition_code, account_head),
                 FOREIGN KEY (exhibition_code) REFERENCES exhibitions(code)
             );
+
+            CREATE TABLE IF NOT EXISTS user_states (
+                chat_id INTEGER PRIMARY KEY,
+                current_exhibition TEXT,
+                active_flow TEXT,
+                flow_step INTEGER DEFAULT 0,
+                flow_data TEXT DEFAULT '{}',
+                updated_at TEXT
+            );
             """
         )
 
@@ -1579,4 +1588,402 @@ def export_report_xlsx(code: str, output_dir: str = "./exports") -> str:
     wb.save(file_path)
     log_action("export_xlsx", code, str(file_path))
     return str(file_path)
+
+
+# ===========================================================================
+# User State Management (DB Persisted)
+# ===========================================================================
+
+import json
+
+def get_user_state(chat_id: int) -> dict:
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM user_states WHERE chat_id = ?", (chat_id,)).fetchone()
+        if row:
+            return dict(row)
+        # Default state
+        default_exh = resolve_default_exhibition()
+        return {
+            "chat_id": chat_id,
+            "current_exhibition": default_exh,
+            "active_flow": None,
+            "flow_step": 0,
+            "flow_data": "{}",
+        }
+
+def set_user_exhibition(chat_id: int, exhibition_code: str) -> None:
+    exhibition_code = normalize_code(exhibition_code)
+    now = _utc_now()
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO user_states (chat_id, current_exhibition, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET current_exhibition = excluded.current_exhibition, updated_at = excluded.updated_at
+            """,
+            (chat_id, exhibition_code, now),
+        )
+
+def set_user_flow(chat_id: int, active_flow: str | None, flow_step: int = 0, flow_data: dict | None = None) -> None:
+    now = _utc_now()
+    data_str = json.dumps(flow_data or {})
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO user_states (chat_id, active_flow, flow_step, flow_data, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET active_flow = excluded.active_flow, flow_step = excluded.flow_step,
+                                               flow_data = excluded.flow_data, updated_at = excluded.updated_at
+            """,
+            (chat_id, active_flow, flow_step, data_str, now),
+        )
+
+def clear_user_flow(chat_id: int) -> None:
+    now = _utc_now()
+    with connect() as conn:
+        conn.execute(
+            """
+            UPDATE user_states 
+            SET active_flow = NULL, flow_step = 0, flow_data = '{}', updated_at = ?
+            WHERE chat_id = ?
+            """,
+            (now, chat_id),
+        )
+
+def resolve_default_exhibition() -> str:
+    try:
+        with connect() as conn:
+            row = conn.execute(
+                "SELECT code FROM exhibitions WHERE status NOT IN ('prototype', 'completed') "
+                "ORDER BY COALESCE(end_date, start_date, '9999') DESC, code LIMIT 1"
+            ).fetchone()
+            if row:
+                return row[0]
+            row = conn.execute("SELECT code FROM exhibitions ORDER BY rowid DESC LIMIT 1").fetchone()
+            if row:
+                return row[0]
+    except Exception:
+        pass
+    raw_default = os.environ.get("DEFAULT_EXHIBITION", "SHWEDAGON2024") or "SHWEDAGON2024"
+    return re.sub(r"[^A-Z0-9_]", "", raw_default.split()[0].upper()) or "SHWEDAGON2024"
+
+
+# ===========================================================================
+# Advanced P&L, Cash Flow, Portfolio, and closeout features
+# ===========================================================================
+
+def get_cash_flow_timeline(code: str) -> List[Dict]:
+    timeline = []
+    with connect() as conn:
+        # Sales cash inflow
+        sales = conn.execute(
+            """
+            SELECT s.sale_date as date, a.title, s.actual_price_thb, s.amount_collected_thb
+            FROM artwork_sales s
+            LEFT JOIN artworks a ON a.id = s.artwork_id
+            WHERE UPPER(s.exhibition_code) = UPPER(?)
+            """, (code,)
+        ).fetchall()
+        for r in sales:
+            timeline.append({
+                "type": "sale",
+                "date": r["date"],
+                "description": f"Sale: {r['title']}",
+                "amount": float(r["amount_collected_thb"] or 0),
+                "total_value": float(r["actual_price_thb"] or 0),
+            })
+        
+        # Expenses cash outflow
+        expenses = conn.execute(
+            """
+            SELECT SUBSTR(created_at, 1, 10) as date, description, amount_thb, account_head
+            FROM confirmed_expenses
+            WHERE UPPER(exhibition_code) = UPPER(?)
+            """, (code,)
+        ).fetchall()
+        for r in expenses:
+            timeline.append({
+                "type": "expense",
+                "date": r["date"],
+                "description": f"{r['account_head']} - {r['description']}",
+                "amount": -float(r["amount_thb"] or 0),
+            })
+            
+    # Sort by date
+    timeline.sort(key=lambda x: x["date"])
+    return timeline
+
+def format_cash_flow_timeline_markdown(code: str) -> str:
+    timeline = get_cash_flow_timeline(code)
+    if not timeline:
+        return f"No cash flow transactions recorded for `{code}`."
+    
+    lines = [f"*Cash Flow Timeline — {code}*", "Only actual cash collected / paid is shown here.", ""]
+    running_balance = 0.0
+    for item in timeline:
+        amount = item["amount"]
+        running_balance += amount
+        sign = "⬆️ +" if amount >= 0 else "⬇️ -"
+        lines.append(f"• `{item['date']}` {sign}{compact_money(abs(amount))} : {item['description']}")
+    
+    lines.append("")
+    lines.append(f"Net Cash Position: *{money(running_balance)}*")
+    return "\n".join(lines)
+
+def format_multi_exhibition_dashboard() -> str:
+    with connect() as conn:
+        exhibitions = conn.execute("SELECT code, name, status FROM exhibitions ORDER BY start_date DESC").fetchall()
+        if not exhibitions:
+            return "No exhibitions found."
+        
+        lines = ["*THE SEA ART GALLERY — Portfolio Dashboard*", ""]
+        portfolio_revenue = 0.0
+        portfolio_expenses = 0.0
+        portfolio_net = 0.0
+        
+        for ex in exhibitions:
+            code = ex["code"]
+            # Calculate P&L lines
+            gallery_rev = conn.execute("SELECT SUM(amount_thb) FROM pnl_lines WHERE exhibition_code=? AND section='gallery_revenue'", (code,)).fetchone()[0] or 0.0
+            direct_cost = conn.execute("SELECT SUM(amount_thb) FROM pnl_lines WHERE exhibition_code=? AND section='direct_cost'", (code,)).fetchone()[0] or 0.0
+            op_exp = conn.execute("SELECT SUM(amount_thb) FROM pnl_lines WHERE exhibition_code=? AND section='operating_expense'", (code,)).fetchone()[0] or 0.0
+            overhead = conn.execute("SELECT SUM(amount_thb) FROM pnl_lines WHERE exhibition_code=? AND section='allocated_overhead'", (code,)).fetchone()[0] or 0.0
+            
+            net_pnl = gallery_rev - direct_cost - op_exp - overhead
+            
+            portfolio_revenue += gallery_rev
+            portfolio_expenses += (direct_cost + op_exp + overhead)
+            portfolio_net += net_pnl
+            
+            status_emoji = "🟢" if ex["status"] == "active" else "⚪"
+            lines.append(
+                f"{status_emoji} *{code}* — {ex['name']} ({ex['status'].upper()})\n"
+                f"  Rev: {compact_money(gallery_rev)} | Exp: {compact_money(direct_cost + op_exp + overhead)}\n"
+                f"  Net P&L: *{compact_money(net_pnl)}*"
+            )
+            lines.append("")
+            
+        lines.append("─────────────────────────")
+        lines.append("🏆 *PORTFOLIO TOTALS*")
+        lines.append(f"• Total Gallery Revenue: *{money(portfolio_revenue)}*")
+        lines.append(f"• Total Expenses: *{money(portfolio_expenses)}*")
+        lines.append(f"• Net Profit/Loss: *{money(portfolio_net)}*")
+        return "\n".join(lines)
+
+def check_budget_alert(exhibition_code: str, account_head: str) -> str | None:
+    with connect() as conn:
+        budget_row = conn.execute(
+            "SELECT budget_thb FROM expense_budgets WHERE exhibition_code=? AND account_head=?",
+            (exhibition_code, account_head)
+        ).fetchone()
+        if not budget_row or not budget_row[0]:
+            return None
+        
+        budget = float(budget_row[0])
+        actual = conn.execute(
+            "SELECT SUM(amount_thb) FROM confirmed_expenses WHERE exhibition_code=? AND account_head=?",
+            (exhibition_code, account_head)
+        ).fetchone()[0] or 0.0
+        
+        pct = (actual / budget) * 100
+        if pct >= 100:
+            return f"🚨 *Budget Overrun Alert!* Category *{account_head}* has spent {money(actual)} out of its {money(budget)} budget ({pct:.1f}%)."
+        elif pct >= 80:
+            return f"⚠️ *Budget Warning!* Category *{account_head}* has spent {money(actual)} out of its {money(budget)} budget ({pct:.1f}%)."
+        return None
+
+def get_exhibition_closeout_status(code: str) -> Dict:
+    with connect() as conn:
+        ex = get_exhibition(code)
+        if not ex:
+            raise ValueError(f"Exhibition not found: {code}")
+        
+        artworks_total = conn.execute("SELECT COUNT(*) FROM artworks WHERE exhibition_code=?", (code,)).fetchone()[0]
+        artworks_sold = conn.execute("SELECT COUNT(*) FROM artworks WHERE exhibition_code=? AND status='sold'", (code,)).fetchone()[0]
+        artworks_avail = artworks_total - artworks_sold
+        
+        pending_count = conn.execute("SELECT COUNT(*) FROM pending_expenses WHERE exhibition_code=? AND status='pending'", (code,)).fetchone()[0]
+        
+        unpaid_artists = conn.execute("SELECT COUNT(*) FROM artist_payables WHERE exhibition_code=? AND outstanding_thb > 0.01", (code,)).fetchone()[0]
+        unpaid_artists_list = conn.execute("SELECT artist, outstanding_thb FROM artist_payables WHERE exhibition_code=? AND outstanding_thb > 0.01", (code,)).fetchall()
+        
+        outstanding_receivables = conn.execute("SELECT SUM(balance_due_thb) FROM artwork_sales WHERE exhibition_code=?", (code,)).fetchone()[0] or 0.0
+        
+        return {
+            "exhibition": dict(ex),
+            "artworks_total": artworks_total,
+            "artworks_sold": artworks_sold,
+            "artworks_avail": artworks_avail,
+            "pending_count": pending_count,
+            "unpaid_artists_count": unpaid_artists,
+            "unpaid_artists": [dict(r) for r in unpaid_artists_list],
+            "outstanding_receivables": outstanding_receivables,
+        }
+
+def format_closeout_status_markdown(code: str) -> str:
+    status = get_exhibition_closeout_status(code)
+    ex = status["exhibition"]
+    lines = [
+        f"🏁 *Close-Out Status — {ex['name']}*",
+        f"Code: `{ex['code']}`",
+        "",
+        "📋 *Close-Out Checklist:*",
+    ]
+    
+    if status["artworks_avail"] == 0:
+        lines.append(f"✅ Artworks: All registered artworks are sold ({status['artworks_sold']}/{status['artworks_total']})")
+    else:
+        lines.append(f"⚠️ Artworks: {status['artworks_avail']} unsold artworks remain in inventory")
+        
+    if status["pending_count"] == 0:
+        lines.append("✅ Expenses: No pending receipt approvals")
+    else:
+        lines.append(f"❌ Expenses: {status['pending_count']} pending receipts must be confirmed or ignored")
+        
+    if status["outstanding_receivables"] < 0.01:
+        lines.append("✅ Sales: All sale payments fully collected")
+    else:
+        lines.append(f"⚠️ Sales: {money(status['outstanding_receivables'])} in receivables outstanding")
+        
+    if status["unpaid_artists_count"] == 0:
+        lines.append("✅ Artists: All artist payables settled in full")
+    else:
+        lines.append(f"❌ Artists: {status['unpaid_artists_count']} artists outstanding ({money(sum(r['outstanding_thb'] for r in status['unpaid_artists']))})")
+        for artist in status["unpaid_artists"]:
+            lines.append(f"  • {artist['artist']}: {money(artist['outstanding_thb'])}")
+            
+    lines.append("")
+    
+    ready = (status["pending_count"] == 0) and (status["unpaid_artists_count"] == 0)
+    if ready:
+        lines.append("🎉 *Exhibition is ready to close!* Use `/close_exhibition` to change status to Completed.")
+    else:
+        lines.append("⚠️ *Exhibition is not ready to close.* Please resolve red items before closing.")
+        
+    return "\n".join(lines)
+
+def close_exhibition_in_db(code: str) -> None:
+    with connect() as conn:
+        conn.execute("UPDATE exhibitions SET status = 'completed', end_date = ? WHERE code = ?", (datetime.now().strftime("%Y-%m-%d"), code))
+        _insert_audit(conn, "close_exhibition", code, "Exhibition closed out and status set to completed.")
+
+def seed_shwedagon_if_missing() -> None:
+    """Seed the Shwe Dagon exhibition using raw sqlite3."""
+    CODE = "SHWEDAGON2024"
+    conversion_rate = float(os.environ.get("SEED_MMK_TO_THB_RATE", "0.006666666666666667"))
+    db_path_val = db_path()
+
+    def thb(mmk: float) -> float:
+        return round(mmk * conversion_rate, 2)
+
+    conn = sqlite3.connect(db_path_val)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    try:
+        conn.execute(
+            """INSERT INTO exhibitions
+               (code, name, location, start_date, end_date, status, currency, notes)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (CODE, "Shwe Dagon Platform Exhibition", "Bangkok / Yangon logistics",
+             "2024-09-01", "2024-09-28", "completed", "THB",
+             f"Auto-seeded. MMK lines at rate={conversion_rate}. "
+             "Artist THB prices from Sheet2 artist list."),
+        )
+
+        pnl_lines = [
+            ("sales_bridge",      "Gross artwork sales",                  "Sales of paintings — Sheet1",                             48_096_000, 10),
+            ("gallery_revenue",   "Gallery artwork revenue",              "Gross revenue — Sheet1. 50% commission basis.",           48_096_000, 20),
+            ("direct_cost",       "Artists' fees / artist share",         "50% artist share — Sheet1",                               25_708_000, 30),
+            ("direct_cost",       "Rotary commission",                    "Partner commission — Sheet1",                                432_000, 31),
+            ("direct_cost",       "Blank canvas",                         "Artwork preparation — Sheet1",                             1_357_000, 32),
+            ("direct_cost",       "Catalog printing",                     "Catalog printing — Sheet1",                                1_200_000, 33),
+            ("direct_cost",       "Local transportation (BKK paintings)", "Local artwork transport — Sheet1",                           336_150, 34),
+            ("operating_expense", "Air cargo YGN→BKK",                   "Inbound exhibition logistics — Sheet1",                    2_355_000, 40),
+            ("operating_expense", "Air cargo BKK→YGN",                   "Return exhibition logistics — Sheet1",                       495_000, 41),
+            ("operating_expense", "Air tickets for CS",                   "Travel cost — Sheet1",                                     2_889_050, 42),
+            ("operating_expense", "Rental of exhibition space",           "Venue rental — Sheet1",                                    3_932_250, 43),
+            ("operating_expense", "Utensil renting",                      "Event supply rental — Sheet1",                               465_000, 44),
+            ("operating_expense", "Coffee & snacks",                      "Opening/event hospitality — Sheet1",                       2_850_000, 45),
+            ("operating_expense", "Photographer",                         "Photography cost — Sheet1",                                  495_000, 46),
+        ]
+        for section, category, description, amount_mmk, sort_order in pnl_lines:
+            conn.execute(
+                """INSERT INTO pnl_lines
+                   (exhibition_code, section, category, description,
+                    amount_thb, source_amount, source_currency, source_ref, sort_order)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (CODE, section, category, description,
+                 thb(amount_mmk), amount_mmk, "MMK",
+                 "22ShweDagonPlatformEstimatedP&L-Sheet1", sort_order),
+            )
+
+        artists = [
+            ("U Lu Min",            2,  126_000),
+            ("Zaw Win Phay",        2,  133_000),
+            ("Min Zayar Oo",        2,   29_750),
+            ("Kyi Hlaing Aung",     3,   29_750),
+            ("Kaung Paing",         1,   22_750),
+            ("Kyaw Lin",            2,   29_750),
+            ("Aye Nyein Myint",     2,   29_750),
+            ("Nu Nu",               3,   29_750),
+            ("Ye Aung Myat",        2,   29_750),
+            ("Orient Thant Zin",    1,   35_000),
+            ("Maung Maung Yin Min", 1,   35_000),
+            ("Myoe Kyaw",           2,   52_500),
+            ("Aung Ko",             2,   28_000),
+            ("Hla Phone Aung",      1,   28_000),
+            ("Win Myint Moe",       4,   42_000),
+            ("Win Myint Moe",       4,   42_000), # Wait, duplicate wins? Handover notes say 26 artists, let's verify Win Myint Moe is once
+            ("Aye Min",             2,   29_750),
+            ("Nann Nann",           4,   61_250),
+            ("CNK",                 3,   52_500),
+            ("Ba Sai Wunna",        3,   35_000),
+            ("Mann Zar Hein",       2,   35_000),
+            ("Saw Lin Aung",        2,   70_000),
+            ("Mor Mor",             2,  126_000),
+            ("U Thu Won",           1,   28_000),
+            ("U Hla Htun Aung",     2,   42_000),
+            ("Thee Zar",            2,   70_000),
+            ("Nyi Htut",            2,   70_000),
+        ]
+        # Filter duplicates (e.g. Win Myint Moe is listed twice in main.py, let's keep only unique)
+        seen_artists = set()
+        unique_artists = []
+        for name, num, price in artists:
+            if name not in seen_artists:
+                seen_artists.add(name)
+                unique_artists.append((name, num, price))
+                
+        for artist_name, num_paintings, unit_thb in unique_artists:
+            gross = round(num_paintings * unit_thb, 2)
+            gallery_commission = round(gross * 0.50, 2)
+            artist_payable = round(gross - gallery_commission, 2)
+            conn.execute(
+                """INSERT INTO artist_payables
+                   (exhibition_code, artist, invoice_ref,
+                    gross_sale_thb, gallery_commission_thb, artist_payable_thb,
+                    paid_thb, outstanding_thb, status,
+                    source_amount, source_currency, notes)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (CODE, artist_name, f"ShweDagon-{artist_name.replace(' ', '')}",
+                 gross, gallery_commission, artist_payable,
+                 0.0, artist_payable, "Pending",
+                 gross, "THB",
+                 f"{num_paintings} painting(s) at ฿{unit_thb:,.0f} each. "
+                 "Sheet2 THB price. 50% gallery commission."),
+            )
+
+        conn.execute(
+            "INSERT INTO audit_log (timestamp, action, exhibition_code, details) VALUES (?, ?, ?, ?)",
+            (datetime.utcnow().isoformat(timespec="seconds") + "Z",
+             "seed_shwedagon", CODE,
+             f"{len(pnl_lines)} P&L lines + {len(unique_artists)} artists seeded via raw sqlite3."),
+        )
+        conn.commit()
+        logger.info("SHWEDAGON2024 seeded successfully")
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
