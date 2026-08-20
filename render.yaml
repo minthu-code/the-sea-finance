@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: the-sea-finance-os
+    env: docker
+    plan: starter
+    autoDeploy: true
+    healthCheckPath: /health
+    disk:
+      name: the-sea-finance-disk
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: DASHBOARD_PASSWORD
+        sync: false
+      - key: DB_PATH
+        value: /data/exhibitledger.db
+      - key: EXPORT_DIR
+        value: /data/exports
+      - key: LOG_LEVEL
+        value: INFO
+      - key: RENDER_EXTERNAL_URL
+        fromService:
+          type: web
+          name: the-sea-finance-os
+          property: host
+      - key: OPENAI_API_KEY
+        sync: false
