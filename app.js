@@ -149,6 +149,23 @@ document.addEventListener('click', function(e){
 $('menuExhibitions').addEventListener('click', function(){ $('avatarMenu').classList.remove('open'); openExhibitionManager(); });
 $('menuReadiness').addEventListener('click', function(){ $('avatarMenu').classList.remove('open'); openReadinessModal(); });
 $('menuExport').addEventListener('click', function(){ $('avatarMenu').classList.remove('open'); exportReport(); });
+$('menuBackup').addEventListener('click', function(){ $('avatarMenu').classList.remove('open'); window.location.href = '/api/backup/download'; });
+$('menuRestore').addEventListener('click', function(){ $('avatarMenu').classList.remove('open'); $('restoreFileInput').click(); });
+$('restoreFileInput').addEventListener('change', async function(){
+  var file = this.files && this.files[0];
+  this.value = '';
+  if (!file) return;
+  if (!confirm('This replaces everything currently in the app with the data in "' + file.name + '". A safety copy of the current database is kept on the server, but the live app will switch to the uploaded file immediately. Continue?')) return;
+  var fd = new FormData();
+  fd.append('file', file);
+  try {
+    var res = await fetch('/api/backup/restore', {method:'POST', body:fd, credentials:'include'});
+    var data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Restore failed');
+    alert('Database restored. Reloading…');
+    location.reload();
+  } catch(e) { alert('Restore failed: ' + e.message); }
+});
 $('exportBtn').addEventListener('click', exportReport);
 function exportReport(){
   if (!state.currentExhibition) return;
@@ -643,32 +660,16 @@ async function submitArtwork(){
 // ── Bulk Import ──
 function openBulkImportModal(){
   openModal(modalShell('Bulk Import Artworks', artIcon(), getVar('--brand'), ''
-    + '<div class="qa-field"><span class="qa-label">📁 Upload Excel / CSV File (.xlsx, .csv)</span>'
-    + '<input type="file" class="qa-input" id="fBulkFile" accept=".xlsx,.xls,.csv"></div>'
-    + '<div style="text-align:center; font-size:11px; color:var(--text3); margin:8px 0;">— OR PASTE TEXT —</div>'
     + '<div class="qa-hint">One artwork per line: Title, Artist, Price</div>'
     + '<textarea class="qa-textarea" id="fBulkData" placeholder="Sunsets, Mike, 50000&#10;Ocean Breeze, Mike, 75000"></textarea>'
     + errorBox('bulkErr')
-    + '<button class="qa-submit-btn" onclick="submitBulkArtworks()">Import Artworks</button>'));
+    + '<button class="qa-submit-btn" onclick="submitBulkArtworks()">Import All</button>'));
 }
 async function submitBulkArtworks(){
-  var fileInput = $('fBulkFile');
-  if (fileInput && fileInput.files && fileInput.files[0]) {
-    var fd = new FormData();
-    fd.append('exhibition_code', state.currentExhibition);
-    fd.append('file', fileInput.files[0]);
-    try {
-      var res = await fetch('/api/artworks/bulk-file', {method:'POST', body:fd, credentials:'include'});
-      var data = await res.json();
-      if (!res.ok) throw new Error(data.detail || 'Upload failed');
-      closeModal(); await refreshAll();
-    } catch(e) { showErr('bulkErr', e.message); }
-  } else {
-    try {
-      var data = await api('/api/artworks/bulk', {method:'POST', body:{exhibition_code: state.currentExhibition, raw_data: $('fBulkData').value}});
-      closeModal(); await refreshAll();
-    } catch(e) { showErr('bulkErr', e.message); }
-  }
+  try {
+    var data = await api('/api/artworks/bulk', {method:'POST', body:{exhibition_code: state.currentExhibition, raw_data: $('fBulkData').value}});
+    closeModal(); await refreshAll();
+  } catch(e) { showErr('bulkErr', e.message); }
 }
 
 // ── Record Sale ──
@@ -722,13 +723,10 @@ async function submitCollect(saleId){
   } catch(e) { showErr('collectErr', e.message); }
 }
 
-// ── Log Expense / Receipt Scan ──
+// ── Log Expense ──
 function openExpenseModal(){
   var opts = state.accountHeads.map(function(h){ return '<option value="' + esc(h) + '">' + esc(h) + '</option>'; }).join('');
-  openModal(modalShell('Log Expense / Scan Receipt', moneyIcon(), '#ff3b30', ''
-    + '<div class="qa-field"><span class="qa-label">📷 Scan Receipt Image (Auto-detects Amount &amp; Category)</span>'
-    + '<input type="file" class="qa-input" id="fExpScanFile" accept="image/*" onchange="onScanReceiptFileSelected()"></div>'
-    + '<div style="text-align:center; font-size:11px; color:var(--text3); margin:8px 0;">— OR ENTER MANUALLY —</div>'
+  openModal(modalShell('Log Expense', moneyIcon(), '#ff3b30', ''
     + '<div class="qa-field"><span class="qa-label">Amount (THB)</span><input class="qa-input" type="number" id="fExpAmt" placeholder="0"></div>'
     + '<div class="qa-field"><span class="qa-label">Description</span><input class="qa-input" id="fExpDesc" placeholder="e.g. Venue deposit"></div>'
     + '<div class="qa-row2">'
@@ -739,20 +737,6 @@ function openExpenseModal(){
     + '<div class="qa-field"><span class="qa-label">Tag to Artist (optional)</span><input class="qa-input" id="fExpArtist" placeholder="Leave blank for gallery-wide"></div>'
     + errorBox('expErr')
     + '<button class="qa-submit-btn" onclick="submitExpense()">Log &amp; Confirm Expense</button>'));
-}
-async function onScanReceiptFileSelected(){
-  var fileInput = $('fExpScanFile');
-  if (!fileInput || !fileInput.files || !fileInput.files[0]) return;
-  var fd = new FormData();
-  fd.append('exhibition_code', state.currentExhibition);
-  fd.append('file', fileInput.files[0]);
-  fd.append('notes', $('fExpDesc').value || fileInput.files[0].name);
-  try {
-    var res = await fetch('/api/ai/scan-receipt', {method:'POST', body:fd, credentials:'include'});
-    var data = await res.json();
-    if (!res.ok) throw new Error(data.detail || 'Scan failed');
-    closeModal(); await refreshAll();
-  } catch(e) { showErr('expErr', e.message); }
 }
 async function submitExpense(){
   try {
@@ -936,25 +920,6 @@ $('seaClose').addEventListener('click', function(){ $('seaPanel').classList.remo
 $('seaPanel').addEventListener('click', function(e){ if (e.target === $('seaPanel')) $('seaPanel').classList.remove('open'); });
 $('seaSend').addEventListener('click', sendSeaMessage);
 $('seaInput').addEventListener('keydown', function(e){ if (e.key === 'Enter') sendSeaMessage(); });
-window.sendSeaQuery = function(text){
-  $('seaInput').value = text;
-  sendSeaMessage();
-};
-
-function renderMarkdown(md){
-  if (!md) return '';
-  var html = esc(md);
-  html = html.replace(/^### (.*$)/gim, '<h3 style="margin:8px 0 4px; font-weight:700; font-size:14px; color:var(--text);">$1</h3>');
-  html = html.replace(/^#### (.*$)/gim, '<h4 style="margin:6px 0 3px; font-weight:600; font-size:13px; color:var(--text);">$1</h4>');
-  html = html.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
-  html = html.replace(/`([^`]+)`/g, '<code style="background:var(--badge-bg); padding:1px 5px; border-radius:4px; font-size:11px;">$1</code>');
-  html = html.replace(/^\- (.*$)/gim, '• $1<br/>');
-  html = html.replace(/^1\. (.*$)/gim, '1. $1<br/>');
-  html = html.replace(/^2\. (.*$)/gim, '2. $1<br/>');
-  html = html.replace(/\n\n/g, '<br/><br/>');
-  return html;
-}
-
 async function sendSeaMessage(){
   var input = $('seaInput');
   var text = input.value.trim();
@@ -966,7 +931,7 @@ async function sendSeaMessage(){
   try {
     var data = await api('/api/ai/analyze', {method:'POST', body:{exhibition_code: state.currentExhibition, query: text, history: state.seaHistory}});
     state.seaHistory.push({role:'user', content:text}, {role:'assistant', content:data.analysis});
-    msgs.insertAdjacentHTML('beforeend', '<div class="sea-msg sea"><div class="sea-msg-bubble">' + renderMarkdown(data.analysis) + '</div></div>');
+    msgs.insertAdjacentHTML('beforeend', '<div class="sea-msg sea"><div class="sea-msg-bubble">' + esc(data.analysis) + '</div></div>');
     msgs.scrollTop = msgs.scrollHeight;
   } catch(e) {
     msgs.insertAdjacentHTML('beforeend', '<div class="sea-msg sea"><div class="sea-msg-bubble">Sorry, something went wrong: ' + esc(e.message) + '</div></div>');

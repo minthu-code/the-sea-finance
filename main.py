@@ -1,11 +1,11 @@
 import os
-import io
-import re
 import logging
+import threading
+import time
 from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, Request, HTTPException, Depends, Form, UploadFile, File
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
-import openpyxl
+import requests
 import uvicorn
 from contextlib import asynccontextmanager
 import exhibitledger as el
@@ -32,6 +32,24 @@ def verify_password(request: Request):
 async def lifespan(app: FastAPI):
     el.init_db()
     logger.info("ExhibitLedger Database Initialized.")
+    # Render's free plan has no persistent disk: the filesystem resets on
+    # redeploy AND after ~15 minutes idle. This background ping keeps the
+    # service warm so idle spin-down (the more common case) doesn't reset
+    # the database. It does NOT protect against a redeploy — use Backup /
+    # Restore in the avatar menu for that.
+    def _keep_alive():
+        url = os.environ.get("RENDER_EXTERNAL_URL")
+        if not url:
+            return
+        if not url.startswith("http"):
+            url = f"https://{url}"
+        while True:
+            time.sleep(600)
+            try:
+                requests.get(f"{url}/health", timeout=10)
+            except Exception:
+                pass
+    threading.Thread(target=_keep_alive, daemon=True).start()
     yield
 
 app = FastAPI(lifespan=lifespan)
@@ -177,95 +195,6 @@ async def api_bulk_import_artworks(request: Request):
     try:
         ids = el.bulk_add_artworks(code, artworks)
         return {"status": "success", "count": len(ids)}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.post("/api/artworks/bulk-file", dependencies=[Depends(verify_password)])
-async def api_bulk_import_artworks_file(
-    exhibition_code: str = Form(...),
-    file: UploadFile = File(...)
-):
-    artworks = []
-    contents = await file.read()
-    filename = file.filename.lower()
-    
-    if filename.endswith(".xlsx") or filename.endswith(".xls"):
-        wb = openpyxl.load_workbook(io.BytesIO(contents), data_only=True)
-        ws = wb.active
-        for row in ws.iter_rows(values_only=True):
-            if not row or not any(row):
-                continue
-            row_str = [str(c or "").strip() for c in row]
-            if "title" in row_str[0].lower() or "artist" in row_str[0].lower():
-                continue
-            if len(row) >= 3:
-                try:
-                    title = str(row[0]).strip()
-                    artist = str(row[1]).strip()
-                    price = float(str(row[2]).replace(",", "").replace("฿", "").strip())
-                    if title and artist and price > 0:
-                        artworks.append({"title": title, "artist": artist, "price": price})
-                except Exception:
-                    continue
-    else:
-        lines = contents.decode("utf-8", errors="ignore").splitlines()
-        for line in lines:
-            if not line.strip():
-                continue
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) >= 3:
-                try:
-                    artworks.append({"title": parts[0], "artist": parts[1], "price": float(parts[2].replace(",", "").replace("฿", ""))})
-                except Exception:
-                    continue
-
-    if not artworks:
-        raise HTTPException(status_code=400, detail="No valid artwork records found in file. Expected columns: Title, Artist, Price")
-
-    try:
-        ids = el.bulk_add_artworks(exhibition_code, artworks)
-        return {"status": "success", "count": len(ids), "artworks": artworks}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.post("/api/ai/scan-receipt", dependencies=[Depends(verify_password)])
-async def api_scan_receipt(
-    exhibition_code: str = Form(...),
-    notes: Optional[str] = Form(None),
-    file: Optional[UploadFile] = File(None)
-):
-    """Scan receipt image or text note and create a pending expense automatically."""
-    raw_text = notes or ""
-    filename = file.filename if file else ""
-    
-    amount = 0.0
-    amount_match = re.search(r'(?:THB|฿|\$)?\s*([0-9,]+(?:\.[0-9]{1,2})?)', raw_text)
-    if amount_match:
-        try:
-            amount = float(amount_match.group(1).replace(",", ""))
-        except Exception:
-            amount = 0.0
-            
-    if amount == 0.0:
-        amount = 500.0
-        
-    description = raw_text.strip() or f"Receipt scan ({filename or 'image'})"
-    suggested_head = el.suggest_account_head(description)
-    
-    try:
-        pending_row = el.create_pending_expense(
-            exhibition_code=exhibition_code,
-            raw_text=f"{amount} {description}",
-            recipient=None,
-            category=suggested_head
-        )
-        return {
-            "status": "success",
-            "pending_expense": dict(pending_row),
-            "amount": amount,
-            "description": description,
-            "suggested_account_head": suggested_head
-        }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -489,6 +418,30 @@ async def api_export(exhibition_code: str):
         return FileResponse(file_path, filename=os.path.basename(file_path))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# --- Backup / restore (Render free plan has no persistent disk) ---
+
+@app.get("/api/backup/download", dependencies=[Depends(verify_password)])
+async def api_backup_download():
+    try:
+        path = el.backup_db_file_path()
+        if not os.path.exists(path):
+            raise HTTPException(status_code=404, detail="No database file found yet.")
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        return FileResponse(path, filename=f"exhibitledger_backup_{stamp}.db", media_type="application/octet-stream")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/backup/restore", dependencies=[Depends(verify_password)])
+async def api_backup_restore(file: UploadFile = File(...)):
+    try:
+        contents = await file.read()
+        el.restore_db_file(contents)
+        return {"status": "success"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))

@@ -2122,6 +2122,60 @@ def close_exhibition_in_db(code: str) -> None:
         _insert_audit(conn, "close_exhibition", code, "Exhibition closed out and status set to completed.")
 
 
+# ---------------------------------------------------------------------------
+# Backup / restore — Render's free plan has no persistent disk, so the live
+# database can be reset on redeploy or a Render-side restart. These helpers
+# let the person download the current .db file and restore it after a reset.
+# ---------------------------------------------------------------------------
+
+
+def backup_db_file_path() -> str:
+    """Path to the live SQLite file, for streaming a backup download."""
+    return db_path()
+
+
+def restore_db_file(uploaded_bytes: bytes) -> str:
+    """Replace the live database with an uploaded .db file.
+
+    Validates that the upload is a real SQLite file with the tables this app
+    expects before touching anything, and keeps a timestamped safety copy of
+    the current database so a bad restore can be undone.
+    """
+    import sqlite3 as _sqlite3
+    import shutil
+    import tempfile
+
+    if not uploaded_bytes or len(uploaded_bytes) < 100:
+        raise ValueError("That file is too small to be a valid database backup.")
+    if uploaded_bytes[:16] != b"SQLite format 3\x00":
+        raise ValueError("That file doesn't look like a SQLite database (.db) file.")
+
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+        tmp.write(uploaded_bytes)
+        tmp_path = tmp.name
+
+    try:
+        check_conn = _sqlite3.connect(tmp_path)
+        tables = {row[0] for row in check_conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        check_conn.close()
+        required = {"exhibitions", "artworks", "artwork_sales", "confirmed_expenses"}
+        missing = required - tables
+        if missing:
+            raise ValueError(f"That file is missing expected tables ({', '.join(sorted(missing))}) — it doesn't look like a Sea Finance backup.")
+
+        live_path = db_path()
+        if os.path.exists(live_path):
+            safety_copy = f"{live_path}.before_restore_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+            shutil.copy2(live_path, safety_copy)
+
+        shutil.copy2(tmp_path, live_path)
+        init_db(live_path)  # re-run column/table migrations against the restored file
+        log_action("restore_database", None, f"Database restored from uploaded backup ({len(uploaded_bytes)} bytes).")
+        return live_path
+    finally:
+        os.unlink(tmp_path)
+
+
 def get_cash_flow_timeline(code: str) -> List[Dict]:
     timeline = []
     with connect() as conn:
@@ -2197,118 +2251,3 @@ def resolve_default_exhibition() -> str:
         pass
     raw_default = os.environ.get("DEFAULT_EXHIBITION", "")
     return re.sub(r"[^A-Z0-9_]", "", raw_default.split()[0].upper()) if raw_default else ""
-
-
-
-def seed_hervalor_if_missing(path: str | None = None) -> None:
-    """Ensure HERVALOR2026 exhibition data exists and is seeded automatically."""
-    with connect(path) as conn:
-        row = conn.execute("SELECT code FROM exhibitions WHERE UPPER(code) = 'HERVALOR2026'").fetchone()
-        if row:
-            # Update status and splits if existing
-            conn.execute("UPDATE exhibitions SET status = 'completed' WHERE UPPER(code) = 'HERVALOR2026'")
-            conn.execute("DELETE FROM commission_splits WHERE UPPER(exhibition_code) = 'HERVALOR2026'")
-            conn.execute("INSERT INTO commission_splits (exhibition_code, party_type, party_name, percent) VALUES ('HERVALOR2026', 'gallery', 'Gallery', 15)")
-            conn.execute("INSERT INTO commission_splits (exhibition_code, party_type, party_name, percent) VALUES ('HERVALOR2026', 'artist', 'Artist', 85)")
-            return
-
-        conn.execute("""
-            INSERT OR REPLACE INTO exhibitions (code, name, location, start_date, end_date, status, currency)
-            VALUES ('HERVALOR2026', 'Her Valor, Her Vision, Her Voice', 'Chiang Mai University Art Center', '2026-05-11', '2026-06-28', 'completed', 'THB')
-        """)
-
-        conn.execute("DELETE FROM commission_splits WHERE UPPER(exhibition_code) = 'HERVALOR2026'")
-        conn.execute("INSERT INTO commission_splits (exhibition_code, party_type, party_name, percent) VALUES ('HERVALOR2026', 'gallery', 'Gallery', 15)")
-        conn.execute("INSERT INTO commission_splits (exhibition_code, party_type, party_name, percent) VALUES ('HERVALOR2026', 'artist', 'Artist', 85)")
-
-        artworks = [
-            ('No.', 'Source: "List of Paintings" sheet, Artists & Artworks Tracking workbook', 80000, 'available'),
-            ('Size', 'Year', 13000, 'available'),
-            ('Asking Price (THB)', 'Year', 13000, 'available'),
-            ('Boat Sutasinee', 'Year', 14000, 'available'),
-            ('Not Finished', 'Year', 14000, 'available'),
-            ('120 x 80 cm', 'Year', 14000, 'available'),
-            ('Mixed Media', 'Year', 14000, 'available'),
-            ('Chuu Wai', 'Year', 14000, 'available'),
-            ('Sleep in peace', 'Year', 14000, 'available'),
-            ('20 × 20 cm', 'Year', 13000, 'available'),
-            ('HOME?', 'Year', 14000, 'available'),
-            ('Woven Dilemma 1', 'Year', 14000, 'available'),
-            ('Woven Dilemma 2', 'Year', 14000, 'available'),
-            ('Woven Dilemma 3', 'Year', 14000, 'available'),
-            ('Woven Dilemma 4', 'Year', 22000, 'available'),
-            ('Woven Dilemma 6', 'Year', 14000, 'available'),
-            ('WOVEN DILEMMA 7', 'Year', 14000, 'available'),
-            ('Woven Dilemma 8', 'Year', 22000, 'available'),
-            ('Woven Dilemma 9', 'Year', 22000, 'available'),
-            ('Woven Dilemma 11', 'Woven Dilemma 10', 22400, 'available'),
-            ('Woven Dilemma 14', 'Woven Dilemma 10', 22400, 'available'),
-            ('ECHOES OF THE LOOM', 'Woven Dilemma 15', 180000, 'available'),
-            ('Witches 2', 'Woven Dilemma 15', 80000, 'available'),
-            ('Witches 1', 'Woven Dilemma 15', 80000, 'available'),
-            ('Kan Nathiwutthikun', 'Woven Dilemma 15', 80000, 'available'),
-            ('155.5 × 156.5 cm', 'Woven Dilemma 15', 80000, 'available'),
-            ('Untitled #wm2-1', 'Acrylic on Canvas', 16000, 'available'),
-            ('300 x 120 cm', 'Acrylic on Canvas', 16000, 'available'),
-            ('Acrylic on Fabric', 'Acrylic on Canvas', 10000, 'available'),
-            ('100 x 80 cm', 'Untitled#Ep1', 30000, 'available'),
-            ('Khin Khin Aye', 'Untitled#Ep1', 30000, 'available'),
-            ('Inside Out Beauty', 'Sleeping Ugly', 128000, 'available'),
-            ('Kyu Kyu', '50 × 60 cm', 80000, 'available'),
-            ('101 x 76 cm', '50 × 60 cm', 96000, 'available'),
-            ('Ma Thi', 'Silent 2', 89000, 'available'),
-            ('Spinning Yarn Under the Moonlight', 'Nann Nann', 67000, 'available'),
-            ('Spinning Yarn Under the Moonlight', 'Nann Nann', 0, 'available'),
-            ('Peace be upon you', 'Nitaya Ueareeworakul', 20000, 'available'),
-            ('PAEN (PANDA)', 'Nitaya Ueareeworakul', 20000, 'available'),
-            ('30 x 30 cm', 'Who When What', 35000, 'available'),
-            ('80 x 100 cm', 'Between day and night 1', 48000, 'available'),
-            ('Pattree Chimnok', 'Between day and night 2', 82500, 'available'),
-            ('100 x 130 cm', 'Body & Earth "when Silent Speaks', 120000, 'available'),
-            ('Phi Phi', 'Body & Earth "when Silent Speaks', 75000, 'available'),
-            ('Sandar Khaing', '107 x 152 cm', 15000, 'available'),
-            ('Inherited Silence', '107 x 152 cm', 15000, 'available'),
-            ('Study on Guardian Angel No 1', 'Sudaporn Teja', 65432, 'available'),
-            ('Study on Guardian Angel No 2', 'Golden Teak Sawdust and Acrylic on Canvas', 57600, 'available'),
-        ]
-        for title, artist, price, status in artworks:
-            conn.execute("INSERT INTO artworks (exhibition_code, title, artist, asking_price_thb, status) VALUES ('HERVALOR2026', ?, ?, ?, ?)", (title, artist, price, status))
-
-        expenses = [
-            (9180, 'Venue Rental', 'Rental Fees', 'Advance Payment', 'CMU Art Center', '2026-05-11'),
-            (21420, 'Venue Rental', 'Rental Fees', 'Second Payment', 'CMU Art Center', '2026-06-03'),
-            (5000, 'Food & Beverage / Hospitality', 'Refreshment', 'Food and Beverages', 'Catering Service', '2026-06-09'),
-            (5028, 'Food & Beverage / Hospitality', 'Refreshment', 'Closing Dinner', 'Samsen Restaurant', '2026-06-18'),
-            (180, 'Venue Rental', 'Venue Services', 'Overtime charges', 'CMU Art Center', '2026-06-09'),
-            (3078, 'Framing & Artwork Preparation', 'Artwork Handling', 'Artwork Transportation from Yangon', 'Air Cargo', '2026-06-16'),
-            (178, 'Framing & Artwork Preparation', 'Artwork Handling', 'Artwork Transportation to Chiang Mai', 'BKK Post Office', '2026-06-17'),
-            (1100, 'Framing & Artwork Preparation', 'Artwork Handling', 'Artwork Transportation to Art Center', 'Car Rental Service', '2026-06-08'),
-            (1100, 'Framing & Artwork Preparation', 'Artwork Handling', 'Artwork Transportation to Art Center', 'Car Rental Service', '2026-06-19'),
-            (1066, 'Framing & Artwork Preparation', 'Artwork Handling', 'Bubble Wraps and Tapes', 'Mr. DIY', '2026-06-20'),
-            (1000, 'Installation & Production', 'Installation and Dismantling', 'Installing', 'Installing Team', '2026-06-08'),
-            (750, 'Installation & Production', 'Installation and Dismantling', 'Dismantling', 'Installing Team', '2026-06-19'),
-            (3000, 'Venue Rental', 'Utilities', 'Mobile Aircon Rental', 'Air-Con Service', '2026-06-09'),
-            (3646.78, 'Travel & Accommodation', 'Artist/Curator Travel', '3 Seats of Bus to Chiang Mai', 'Bus', '2026-06-08'),
-            (1593.6, 'Travel & Accommodation', 'Artist/Curator Travel', '2 Seats of Bus to Chiang Mai', 'Bus', '2026-06-20'),
-            (10000, 'Travel & Accommodation', 'Artist/Curator Travel', 'Hotel Room Charges', 'B House Hotel', '2026-06-22'),
-            (2941, 'Installation & Production', 'Signage and Labels', 'Printing of Artists\' Biography', 'Printing House', '2026-06-10'),
-            (500, 'Installation & Production', 'Display Materials', 'Fabrics', 'Fabrics Vendor', '2026-06-08'),
-            (3350, 'Framing & Artwork Preparation', 'Artwork Handling', 'Artwork Framing', 'Framing Service', '2026-06-25'),
-            (74111, '', 'Miscellaneous (Needs Review)', 'Printed total on source PDF', '', '2026-05-11'),
-        ]
-        for amt, desc, head, cat, rec, dt in expenses:
-            conn.execute("INSERT INTO expenses_confirmed (exhibition_code, amount_thb, description, account_head, category, recipient, created_at) VALUES ('HERVALOR2026', ?, ?, ?, ?, ?, ?)", (amt, desc, head, cat, rec, dt))
-
-        budgets = [
-            ('Venue Rental', 33780),
-            ('Framing & Artwork Preparation', 9872),
-            ('Installation & Production', 5191),
-            ('Marketing & PR', 0),
-            ('Staff & Helpers / Labor', 0),
-            ('Travel & Accommodation', 15240),
-            ('Food & Beverage / Hospitality', 0),
-            ('Office & Admin Supplies', 0),
-            ('Miscellaneous (Needs Review)', 0),
-        ]
-        for head, b_amt in budgets:
-            conn.execute("INSERT INTO expense_budgets (exhibition_code, account_head, budget_thb) VALUES ('HERVALOR2026', ?, ?)", (head, b_amt))

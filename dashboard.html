@@ -588,6 +588,14 @@ button { font-family: inherit; }
           <button class="avatar-menu-row" id="menuExport">
             <div class="row-left"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg><span>Export Report</span></div>
           </button>
+          <div class="avatar-menu-divider"></div>
+          <button class="avatar-menu-row" id="menuBackup">
+            <div class="row-left"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg><span>Backup Database</span></div>
+          </button>
+          <button class="avatar-menu-row" id="menuRestore">
+            <div class="row-left"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg><span>Restore Database</span></div>
+          </button>
+          <input type="file" id="restoreFileInput" accept=".db" style="display:none;">
           <div class="avatar-menu-divider" id="signOutDivider" style="display:none;"></div>
           <a class="avatar-menu-row danger" href="#" id="signOutRow" style="display:none;">
             <div class="row-left"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16,17 21,12 16,7"/><line x1="21" y1="12" x2="9" y2="12"/></svg><span>Sign out</span></div>
@@ -674,12 +682,6 @@ button { font-family: inherit; }
     </div>
     <div class="sea-messages" id="seaMessages">
       <div class="sea-msg sea"><div class="sea-msg-bubble">Hi, I'm SEA. Ask me about this exhibition's burn rate, artist ROI, receivables, or what needs attention before close-out.</div></div>
-    </div>
-    <div style="display:flex; gap:6px; padding:6px 14px; overflow-x:auto; background:var(--bg3); border-top:1px solid var(--divider);">
-      <button class="pill-btn" onclick="sendSeaQuery('Executive Summary')">📊 Summary</button>
-      <button class="pill-btn" onclick="sendSeaQuery('Artist ROI')">🎨 Artist ROI</button>
-      <button class="pill-btn" onclick="sendSeaQuery('Forecast & Burn Rate')">🔮 Burn Rate</button>
-      <button class="pill-btn" onclick="sendSeaQuery('Expense Breakdown')">💸 Expenses</button>
     </div>
     <div class="sea-input-row">
       <input type="text" class="qa-input" id="seaInput" placeholder="Ask about revenue, ROI, budget…">
